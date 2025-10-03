@@ -19,7 +19,8 @@ class NamedEvent:
         self._shm = GuardedSharedMemory(f"__pyfastipc_event_{name}", size=4)
         self._name = name
         self._futex = FutexWord(self._shm.buf, shared=True)
-        self._futex.store_release(0)
+        if self._shm.created:
+            self._futex.store_release(0)
 
     def set(self) -> None:
         """
