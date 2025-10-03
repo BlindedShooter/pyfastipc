@@ -39,7 +39,7 @@ skip = ["pp*", "*-win32", "*-macosx*"]
 archs = ["x86_64", "aarch64"]
 # Keep default compiler flags from setup.py; avoid -march=native for wheel portability.
 test-command = [
-  "python - <<'PY'\nfrom array import array\nfrom fastipc import Mutex\nm = Mutex(memoryview(array('I',[0])))\nassert m.acquire(); m.release()\nprint('fastipc wheel sanity OK')\nPY",
+  "python - <<'PY'\nfrom fastipc import Mutex\nm = Mutex(memoryview(bytearray(64)))\nassert m.acquire(); m.release()\nprint('fastipc wheel sanity OK')\nPY",
 ]
 # Modern images; adjust if you need older glibc compatibility.
 manylinux-x86_64-image = "manylinux_2_28"
