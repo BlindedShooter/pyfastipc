@@ -1,16 +1,14 @@
 import atexit
+import ctypes
+import ctypes.util
 import errno
+import mmap
 import os
 import random
-import sys
 import time
-from multiprocessing import resource_tracker
-from multiprocessing.shared_memory import SharedMemory
+from typing import Optional
 
 __all__ = ["GuardedSharedMemory"]
-
-
-SHM_TRACK_SUPPORTED = sys.version_info >= (3, 13)
 
 
 def _alive(pid: int) -> bool:
@@ -21,7 +19,73 @@ def _alive(pid: int) -> bool:
         return e.errno == errno.EPERM
 
 
-class GuardedSharedMemory(SharedMemory):
+def _load_posix_shm_lib() -> ctypes.CDLL:
+    """Return a libc/librt handle that exposes shm_open/shm_unlink."""
+
+    candidates = []
+    try:
+        candidates.append(ctypes.CDLL(None, use_errno=True))
+    except OSError:
+        pass
+
+    librt = ctypes.util.find_library("rt")
+    if librt:
+        try:
+            candidates.append(ctypes.CDLL(librt, use_errno=True))
+        except OSError:
+            pass
+
+    libc = ctypes.util.find_library("c")
+    if libc:
+        try:
+            lib = ctypes.CDLL(libc, use_errno=True)
+        except OSError:
+            pass
+        else:
+            if lib not in candidates:
+                candidates.append(lib)
+
+    for lib in candidates:
+        if getattr(lib, "shm_open", None) and getattr(lib, "shm_unlink", None):
+            return lib
+    raise RuntimeError("POSIX shared memory APIs not available on this platform")
+
+
+_POSIX_SHM = _load_posix_shm_lib()
+
+_shm_open = _POSIX_SHM.shm_open
+_shm_open.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_uint]
+_shm_open.restype = ctypes.c_int
+
+_shm_unlink = _POSIX_SHM.shm_unlink
+_shm_unlink.argtypes = [ctypes.c_char_p]
+_shm_unlink.restype = ctypes.c_int
+
+
+def _shm_open_wrapped(name: bytes, flags: int, mode: int) -> int:
+    ctypes.set_errno(0)
+    fd = _shm_open(name, flags, mode)
+    if fd != -1:
+        return fd
+    err = ctypes.get_errno()
+    if err == errno.ENOENT:
+        raise FileNotFoundError(errno.ENOENT, os.strerror(err), name.decode())
+    if err == errno.EEXIST:
+        raise FileExistsError(errno.EEXIST, os.strerror(err), name.decode())
+    raise OSError(err, os.strerror(err))
+
+
+def _shm_unlink_wrapped(name: bytes) -> None:
+    ctypes.set_errno(0)
+    if _shm_unlink(name) == 0:
+        return
+    err = ctypes.get_errno()
+    if err in (errno.ENOENT,):
+        return
+    raise OSError(err, os.strerror(err))
+
+
+class GuardedSharedMemory:
     """
     attach or create a shared memory segment with PID tracking.
     This class ensures that the shared memory segment is created or attached
@@ -49,63 +113,95 @@ class GuardedSharedMemory(SharedMemory):
             max_attempts: The maximum number of attempts to create/attach the segment.
             backoff_base: The base backoff time (in seconds) for retrying failed attempts.
         """
-        self._g_name = name
-        self._g_size = size
+        if size <= 0:
+            raise ValueError("size must be a positive integer")
+
+        # Normalize name for POSIX shm (leading slash required) but keep exposed form.
+        if not name:
+            raise ValueError("name must be a non-empty string")
+        if "/" in name:
+            # POSIX shared memory names cannot contain '/' aside from leading position.
+            raise ValueError("name cannot contain '/' characters")
+
+        self._name = name
+        self._posix_name = f"/{name}"
+        self._posix_name_b = self._posix_name.encode("utf-8")
+
         self._pid = os.getpid()
-        # Allow overriding pid dir for restricted environments (e.g., CI sandboxes)
+        self._size = size
+        self._fd: Optional[int] = None
+        self._mmap: Optional[mmap.mmap] = None
+        self._buf: Optional[memoryview] = None
+        self._closed = False
+        self._unlinked = False
+
         pid_root = os.environ.get("FASTIPC_PID_DIR", pid_dir)
         self._pdir = f"{pid_root.rstrip('/')}/{name}.pids"
         os.makedirs(self._pdir, exist_ok=True)
 
         last_err = None
         self.created = False
+
         for _ in range(max_attempts):
+            fd: Optional[int] = None
+            created = False
             try:
-                # Try to attach
                 try:
-                    if SHM_TRACK_SUPPORTED:
-                        super().__init__(name=name, create=False, track=False)
-                    else:
-                        super().__init__(name=name, create=False)
+                    fd = _shm_open_wrapped(self._posix_name_b, os.O_RDWR, 0o600)
                 except FileNotFoundError:
-                    # Try to create if not found
-                    try:
-                        if SHM_TRACK_SUPPORTED:
-                            super().__init__(
-                                name=name, create=True, size=size, track=False
-                            )
-                        else:
-                            super().__init__(name=name, create=True, size=size)
-                        self.created = True
-                    except FileExistsError:
-                        # Retry if another process created it
-                        raise
-                # Validate size
-                if self.size < size:
-                    super().close()
-                    raise ValueError(
-                        f"Existing shm '{name}' size {self.size} < requested {size}"
+                    fd = _shm_open_wrapped(
+                        self._posix_name_b,
+                        os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                        0o600,
                     )
-                # unregister tracker if python < 3.13
-                if not SHM_TRACK_SUPPORTED:
-                    try:
-                        resource_tracker.unregister(self._name, "shared_memory")  # type: ignore[attr-defined]
-                    except KeyError:
-                        pass
-                break  # successful attach/create
+                    os.ftruncate(fd, size)
+                    created = True
+
+                stat_result = os.fstat(fd)
+                actual_size = stat_result.st_size
+                if actual_size < size:
+                    raise ValueError(
+                        f"Existing shm '{name}' size {actual_size} < requested {size}"
+                    )
+
+                mm = mmap.mmap(fd, actual_size, access=mmap.ACCESS_WRITE)
+                self._fd = fd
+                self._mmap = mm
+                self._buf = memoryview(mm)
+                self._size = actual_size
+                self.created = created
+                break
             except (FileNotFoundError, FileExistsError, ValueError) as e:
                 last_err = e
-                # Race: short backoff before retrying
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    if created:
+                        try:
+                            _shm_unlink_wrapped(self._posix_name_b)
+                        except OSError:
+                            pass
                 time.sleep(backoff_base * (1 + random.random()))
+            except Exception:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    if created:
+                        try:
+                            _shm_unlink_wrapped(self._posix_name_b)
+                        except OSError:
+                            pass
+                raise
         else:
-            # Failed to escape loop
             raise RuntimeError(
                 f"Failed to attach/create shm '{name}' after {max_attempts} attempts"
             ) from last_err
 
         atexit.register(self.close)
-        # PID registration + atexit
-        os.makedirs(self._pdir, exist_ok=True)
         with open(f"{self._pdir}/{self._pid}", "w"):
             pass
 
@@ -123,46 +219,37 @@ class GuardedSharedMemory(SharedMemory):
         Check if any processes are still using the shared memory segment.
         Unlink the shared memory segment if it is no longer in use.
         """
-        # Clean up dead PIDs
+        if self._closed:
+            return
+
+        self._cleanup_dead_pids()
+        self._remove_pid_file()
+
+        if self._has_other_alive_pids():
+            self._detach()
+            self._closed = True
+            self._unregister_atexit()
+            return
+
         try:
-            for fn in os.listdir(self._pdir):
-                if fn.isdigit() and not _alive(int(fn)):
-                    try:
-                        os.unlink(f"{self._pdir}/{int(fn)}")
-                    except FileNotFoundError:
-                        pass
-                    except KeyError:
-                        pass
-        except FileNotFoundError:
+            self.unlink()
+        except OSError:
             pass
 
-        # Remove my PID file
-        try:
-            os.unlink(f"{self._pdir}/{self._pid}")
-        except FileNotFoundError:
-            pass
-
-        # If any PIDs remain, exit (other processes are still using the shm)
-        try:
-            for fn in os.listdir(self._pdir):
-                if fn.isdigit() and _alive(int(fn)):
-                    super().close()
-                    return
-        except FileNotFoundError:
-            pass
-
-        # If it looks like I was the last one, clean up
-        try:
-            super().unlink()
-        except FileNotFoundError:
-            pass
-        except KeyError:
-            pass
         try:
             os.rmdir(self._pdir)
         except OSError:
             pass
-        super().close()
+
+        self._detach()
+        self._closed = True
+        self._unregister_atexit()
+
+    def unlink(self) -> None:
+        if self._unlinked:
+            return
+        _shm_unlink_wrapped(self._posix_name_b)
+        self._unlinked = True
 
     def __enter__(self) -> "GuardedSharedMemory":
         return self
@@ -177,5 +264,73 @@ class GuardedSharedMemory(SharedMemory):
             pass
         try:
             atexit.unregister(self.close)  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+    @property
+    def buf(self) -> memoryview:
+        if self._buf is None:
+            raise ValueError("Shared memory is closed")
+        return self._buf
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def _cleanup_dead_pids(self) -> None:
+        try:
+            for fn in os.listdir(self._pdir):
+                if fn.isdigit() and not _alive(int(fn)):
+                    try:
+                        os.unlink(f"{self._pdir}/{fn}")
+                    except FileNotFoundError:
+                        pass
+        except FileNotFoundError:
+            pass
+
+    def _remove_pid_file(self) -> None:
+        try:
+            os.unlink(f"{self._pdir}/{self._pid}")
+        except FileNotFoundError:
+            pass
+
+    def _has_other_alive_pids(self) -> bool:
+        try:
+            for fn in os.listdir(self._pdir):
+                if fn.isdigit():
+                    pid = int(fn)
+                    if pid != self._pid and _alive(pid):
+                        return True
+        except FileNotFoundError:
+            pass
+        return False
+
+    def _detach(self) -> None:
+        if self._buf is not None:
+            try:
+                self._buf.release()
+            except AttributeError:
+                pass
+            self._buf = None
+        if self._mmap is not None:
+            try:
+                self._mmap.close()
+            except Exception:
+                pass
+            self._mmap = None
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+
+    def _unregister_atexit(self) -> None:
+        try:
+            atexit.unregister(self.close)
         except Exception:
             pass

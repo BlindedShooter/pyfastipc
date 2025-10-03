@@ -1,3 +1,4 @@
 2025-10-03: Re-implemented Mutex and Semaphore to use 64B headers in C (src/fastipc/_primitives/_primitives.c). Added magic numbers, owner PID, last_acquired_ns tracking, and Mutex.force_release(). Updated NamedMutex/NamedSemaphore to allocate 64B and exposed metadata helpers.
 2025-10-03: Added pytest tests for GuardedSharedMemory and reworked them to use pytest-benchmark for create/attach/get_num_procs paths.
 2025-10-03: Packaging/CI: removed checked-in .so; added setup.py for C extension; added GitHub Actions CI; added pytest.ini with bench_heavy marker, and marked heavy benchmarks; added negative tests; implemented Mutex.acquire_ns(timeout_ns, spin) with stubs and tests; hardened GuardedSharedMemory __del__.
+2025-10-03: Replaced GuardedSharedMemory's multiprocessing.SharedMemory base with direct POSIX shm_open/mmap implementation while keeping PID tracking and cleanup semantics intact.
