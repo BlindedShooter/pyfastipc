@@ -13,6 +13,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 #ifndef PyCFunction_CAST
 #define PyCFunction_CAST(func) ((PyCFunction)(void (*)(void))(func))
@@ -844,38 +845,74 @@ static void FutexSemaphore_dealloc(FutexSemaphore *self)
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
+static int semaphore_add_tokens(FutexSemaphore *self, uint32_t add, uint32_t *prev_out)
+{
+    _Atomic uint32_t *c = (_Atomic uint32_t *)(self->base + SEM_OFF_COUNT);
+    if (add == 0)
+    {
+        if (prev_out)
+            *prev_out = atomic_load_explicit(c, memory_order_acquire);
+        return 0;
+    }
+
+    for (;;)
+    {
+        uint32_t cur = atomic_load_explicit(c, memory_order_acquire);
+        if (cur > UINT32_MAX - add)
+        {
+            PyErr_SetString(PyExc_OverflowError, "semaphore count overflow");
+            return -1;
+        }
+        if (atomic_compare_exchange_weak_explicit(c, &cur, cur + add, memory_order_release, memory_order_acquire))
+        {
+            if (prev_out)
+                *prev_out = cur;
+            return 0;
+        }
+    }
+}
+
+static void semaphore_wake_waiters(FutexSemaphore *self, uint32_t prev, uint32_t add)
+{
+    if (add == 0 || prev != 0)
+        return;
+
+    int wake_n = add > (uint32_t)INT_MAX ? INT_MAX : (int)add;
+    if (wake_n <= 0)
+        wake_n = INT_MAX;
+
+    int op_wake = self->shared ? FUTEX_WAKE : FUTEX_WAKE_PRIVATE;
+    int ret;
+    Py_BEGIN_ALLOW_THREADS
+        ret = (int)syscall(SYS_futex, (uint32_t *)(self->base + SEM_OFF_COUNT), op_wake, wake_n, NULL, NULL, 0);
+    Py_END_ALLOW_THREADS(void)ret;
+}
+
 static PyObject *FutexSemaphore_post(FutexSemaphore *self, PyObject *args, PyObject *kw)
 {
     static char *kwlist[] = {"n", NULL};
-    unsigned int n = 1;
-    if (!PyArg_ParseTupleAndKeywords(args, kw, "|I", kwlist, &n))
+    unsigned long long n_ull = 1;
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "|K", kwlist, &n_ull))
         return NULL;
-    _Atomic uint32_t *c = (_Atomic uint32_t *)(self->base + SEM_OFF_COUNT);
-    uint32_t prev = atomic_fetch_add_explicit(c, n, memory_order_release);
-    if (prev == 0)
+    if (n_ull > UINT32_MAX)
     {
-        int op_wake = self->shared ? FUTEX_WAKE : FUTEX_WAKE_PRIVATE;
-        int wake_n = (int)n;
-        int ret;
-        Py_BEGIN_ALLOW_THREADS
-            ret = (int)syscall(SYS_futex, (uint32_t *)(self->base + SEM_OFF_COUNT), op_wake, wake_n, NULL, NULL, 0);
-        Py_END_ALLOW_THREADS(void) ret;
+        PyErr_SetString(PyExc_OverflowError, "semaphore increment out of range");
+        return NULL;
     }
+    uint32_t add = (uint32_t)n_ull;
+    uint32_t prev = 0;
+    if (semaphore_add_tokens(self, add, &prev) < 0)
+        return NULL;
+    semaphore_wake_waiters(self, prev, add);
     Py_RETURN_NONE;
 }
 
-static PyObject *__attribute__((unused)) FutexSemaphore_post1(FutexSemaphore *self, PyObject *Py_UNUSED(ignored))
+static PyObject *FutexSemaphore_post1(FutexSemaphore *self, PyObject *Py_UNUSED(ignored))
 {
-    _Atomic uint32_t *c = (_Atomic uint32_t *)(self->base + SEM_OFF_COUNT);
-    uint32_t prev = atomic_fetch_add_explicit(c, 1, memory_order_release);
-    if (prev == 0)
-    {
-        int op_wake = self->shared ? FUTEX_WAKE : FUTEX_WAKE_PRIVATE;
-        int ret;
-        Py_BEGIN_ALLOW_THREADS
-            ret = (int)syscall(SYS_futex, (uint32_t *)(self->base + SEM_OFF_COUNT), op_wake, 1, NULL, NULL, 0);
-        Py_END_ALLOW_THREADS(void) ret;
-    }
+    uint32_t prev = 0;
+    if (semaphore_add_tokens(self, 1u, &prev) < 0)
+        return NULL;
+    semaphore_wake_waiters(self, prev, 1u);
     Py_RETURN_NONE;
 }
 
@@ -922,22 +959,6 @@ static PyObject *FutexSemaphore_wait(FutexSemaphore *self, PyObject *args, PyObj
         err = errno;
         Py_END_ALLOW_THREADS if (ret == -1 && err == ETIMEDOUT) Py_RETURN_FALSE;
         // else loop (spurious wake-ups tolerated)
-    }
-}
-
-// Not exported: kept for potential future tuning
-static PyObject *__attribute__((unused)) FutexSemaphore_wait_fast(FutexSemaphore *self, PyObject *Py_UNUSED(ignored))
-{
-    _Atomic uint32_t *c = (_Atomic uint32_t *)(self->base + SEM_OFF_COUNT);
-    int blocked = 0;
-    for (;;)
-    {
-        int op_wait = self->shared ? FUTEX_WAIT : FUTEX_WAIT_PRIVATE;
-        int ret;
-        Py_BEGIN_ALLOW_THREADS
-            ret = (int)syscall(SYS_futex, (uint32_t *)(self->base + SEM_OFF_COUNT), op_wait, 0, NULL, NULL, 0);
-        Py_END_ALLOW_THREADS(void) ret;
-        blocked = 1;
     }
 }
 
