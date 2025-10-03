@@ -77,7 +77,7 @@ Notes:
 ## Performance Notes
 - Uncontended paths use only atomics (no syscalls).
 - Under contention, primitives spin briefly (adaptive) then `futex` sleep to minimize wake storms and context switches.
-- `Semaphore.post(n)` wakes only on 0→non‑zero transitions and delivers up to `n` tokens without overshooting.
+- `Semaphore.post(n)` atomically adds `n` tokens and only wakes waiters when the count transitions from 0; the wake hint is capped at `min(n, INT_MAX)` to stay portable.
 - Expect on-par or better performance than `posix_ipc` and `multiprocessing` alternatives in most scenarios. 
 
 ## Platform Support
