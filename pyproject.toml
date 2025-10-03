@@ -12,14 +12,22 @@ license = "MIT"
 license-files = ["LICENSE",]
 authors = [{ name = "JihunLee", email = "gkadnflh@gmail.com" }]
 classifiers = [
-  "LICENSE :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: C"
 ]
 
+[project.optional-dependencies]
+test = [
+  "pytest",
+  "pytest-timeout",
+  "pytest-benchmark"
+]
+
 [project.urls]
-Homepage = "https://github.com/BlindedShooter/fastipc"
+homepage = "https://github.com/BlindedShooter/fastipc"
+repository = "https://github.com/BlindedShooter/fastipc"
+Issues = "https://github.com/BlindedShooter/fastipc/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
