@@ -25,39 +25,25 @@ pip install fastipc
 - `Mutex`: futex‑based mutex with spin‑then‑sleep contention path.
 - `Semaphore`: futex‑based counting semaphore with exact‑delivery wakeups.
 
-## Quick Start (threads)
-```python
-from array import array
-from fastipc import FutexWord, Mutex, Semaphore, AtomicU32
-
-# All primitives require a 4-byte aligned buffer (>= 4 bytes)
-buf = array('I', [0])
-
-# FutexWord: wait/wake on a raw word
-fw = FutexWord(memoryview(buf))
-fw.store_release(1)
-fw.wake(1)
-
-# Mutex usage
-m = Mutex(memoryview(buf))
-with m:
-    ...  # critical section
-
-# Semaphore usage
-s = Semaphore(memoryview(buf), initial=0)
-s.post(1)
-s.wait()  # blocks until a token is available
-```
 
 ## Cross‑Process: Buffer‑backed
 ```python
 from multiprocessing import shared_memory
-from fastipc import FutexWord
+from fastipc import FutexWord, Mutex, Semaphore
 
 shm = shared_memory.SharedMemory(create=True, size=4)
 try:
     fw = FutexWord(shm.buf, shared=True)
     # Other processes attach via SharedMemory(name=...) and reuse the same buffer
+finally:
+    shm.close(); shm.unlink()
+
+# Mutex and Semaphore require 64 bytes
+shm = shared_memory.SharedMemory(create=True, size=64)
+try:
+    mtx = Mutex(shm.buf)
+    with mtx:
+        ...  # critical section
 finally:
     shm.close(); shm.unlink()
 ```
@@ -92,8 +78,7 @@ Notes:
 - Uncontended paths use only atomics (no syscalls).
 - Under contention, primitives spin briefly (adaptive) then `futex` sleep to minimize wake storms and context switches.
 - `Semaphore.post(n)` wakes only on 0→non‑zero transitions and delivers up to `n` tokens without overshooting.
-
-Benchmarks are included under `benchmarks/` and support `--format pretty|json`, warmup, and `--repeat`. Results vary by CPU and kernel.
+- Expect on-par or better performance than `posix_ipc` and `multiprocessing` alternatives in most scenarios. 
 
 ## Platform Support
 - Linux only (uses `linux/futex.h`).
