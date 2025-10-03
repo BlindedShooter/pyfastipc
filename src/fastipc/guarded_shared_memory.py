@@ -171,5 +171,11 @@ class GuardedSharedMemory(SharedMemory):
         self.close()
 
     def __del__(self) -> None:
-        self.close()
-        atexit.unregister(self.close)  # type: ignore[attr-defined]
+        try:
+            self.close()
+        except Exception:
+            pass
+        try:
+            atexit.unregister(self.close)  # type: ignore[attr-defined]
+        except Exception:
+            pass

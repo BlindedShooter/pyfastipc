@@ -155,10 +155,10 @@ class Mutex:
     """
     def __init__(self, buffer: memoryview, shared: bool = True) -> None:
         """
-        Initialize a mutex.
+        Initialize a mutex over a 64-byte header.
 
         Args:
-            buffer: The memory buffer to use. Must be a writable, aligned buffer.
+            buffer: The memory buffer to use. Must be writable, 4-byte aligned, and at least 64 bytes.
             shared: Whether the mutex is shared between threads.
         """
         ...
@@ -169,6 +169,19 @@ class Mutex:
 
         Returns:
             True if the mutex was acquired, False if it was already held.
+        """
+        ...
+
+    def acquire_ns(self, timeout_ns: int = -1, spin: int = 16) -> bool:
+        """
+        Acquire the mutex with an optional timeout and spin.
+
+        Args:
+            timeout_ns: Timeout in nanoseconds (-1 = infinite, 0 = non-blocking).
+            spin: Number of spin attempts before blocking on futex.
+
+        Returns:
+            True if acquired, False if timed out or would block when timeout_ns==0.
         """
         ...
 
@@ -185,6 +198,25 @@ class Mutex:
         """
         Release the mutex.
         """
+        ...
+
+    def force_release(self) -> None:
+        """
+        Forcibly unlock the mutex regardless of ownership and wake one waiter if contended.
+        Intended for recovery from crashed owners.
+        """
+        ...
+
+    def owner_pid(self) -> int:
+        """Return the current owner PID, or 0 if unlocked."""
+        ...
+
+    def last_acquired_ns(self) -> int:
+        """Return CLOCK_REALTIME nanoseconds of the last successful acquire."""
+        ...
+
+    def magic(self) -> int:
+        """Return the magic constant identifying the header ('MUTX')."""
         ...
 
     def __enter__(self) -> "Mutex":
@@ -211,10 +243,10 @@ class Semaphore:
         self, buffer: memoryview, initial: int | None = None, shared: bool = True
     ) -> None:
         """
-        Initialize a semaphore.
+        Initialize a semaphore over a 64-byte header.
 
         Args:
-            buffer: The memory buffer to use. Must be a writable, aligned buffer.
+            buffer: The memory buffer to use. Must be writable, 4-byte aligned, and at least 64 bytes.
             initial: Optional initial value for a newly created semaphore.
                 If None, the value is not modified (attach-only semantics).
             shared: Whether the semaphore is shared between threads.
@@ -259,4 +291,16 @@ class Semaphore:
         Returns:
             The current value of the semaphore.
         """
+        ...
+
+    def last_acquired_ns(self) -> int:
+        """Return CLOCK_REALTIME nanoseconds of the last successful wait (token acquisition)."""
+        ...
+
+    def last_pid(self) -> int:
+        """Return PID of the last process/thread that acquired a token."""
+        ...
+
+    def magic(self) -> int:
+        """Return the magic constant identifying the header ('SEMA')."""
         ...

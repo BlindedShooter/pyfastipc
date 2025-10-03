@@ -12,6 +12,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifndef PyCFunction_CAST
 #define PyCFunction_CAST(func) ((PyCFunction)(void (*)(void))(func))
@@ -428,10 +429,78 @@ static PyTypeObject AtomicU64Type = {
     .tp_repr = (reprfunc)AtomicU64_repr,
 };
 
-// Futex-based Mutex (state: 0 unlocked, 1 locked, 2 locked contended)
+// 64B cacheline-aligned style headers for primitives
+// Layout (Mutex):
+//   0x00: u32 magic ('MUTX')
+//   0x04: u32 flags (reserved)
+//   0x08: u32 state (futex word; 0=unlocked,1=locked,2=contended)
+//   0x0C: u32 owner_pid (PID holding lock or 0)
+//   0x10: u64 last_acquired_ns (CLOCK_REALTIME in ns)
+//   0x18..0x3F: reserved
+#define MUTEX64_SIZE 64u
+#define MUTEX_MAGIC 0x4D555458u /* 'MUTX' */
+#define MUTEX_OFF_MAGIC 0u
+#define MUTEX_OFF_FLAGS 4u
+#define MUTEX_OFF_STATE 8u
+#define MUTEX_OFF_OWNER 12u
+#define MUTEX_OFF_LASTNS 16u
+
+// Layout (Semaphore):
+//   0x00: u32 magic ('SEMA')
+//   0x04: u32 flags (reserved)
+//   0x08: u32 count (futex word)
+//   0x0C: u32 last_pid (last successful waiter pid)
+//   0x10: u64 last_acquired_ns (CLOCK_REALTIME in ns)
+//   0x18..0x3F: reserved
+#define SEM64_SIZE 64u
+#define SEM_MAGIC 0x53454D41u /* 'SEMA' */
+#define SEM_OFF_MAGIC 0u
+#define SEM_OFF_FLAGS 4u
+#define SEM_OFF_COUNT 8u
+#define SEM_OFF_LASTPID 12u
+#define SEM_OFF_LASTNS 16u
+
+static inline uint64_t now_realtime_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static inline void u32_store_rel(void *base, size_t off, uint32_t v)
+{
+    atomic_store_explicit((_Atomic uint32_t *)((uint8_t *)base + off), v, memory_order_release);
+}
+static inline uint32_t u32_load_acq(void *base, size_t off)
+{
+    return atomic_load_explicit((_Atomic uint32_t *)((uint8_t *)base + off), memory_order_acquire);
+}
+static inline uint32_t u32_xchg_rel(void *base, size_t off, uint32_t v)
+{
+    return atomic_exchange_explicit((_Atomic uint32_t *)((uint8_t *)base + off), v, memory_order_release);
+}
+static inline bool u32_cas_acqrel(void *base, size_t off, uint32_t *expected, uint32_t desired)
+{
+    return atomic_compare_exchange_strong_explicit((_Atomic uint32_t *)((uint8_t *)base + off), expected, desired, memory_order_acq_rel, memory_order_acquire);
+}
+static inline void u64_store_rel_unaligned(void *base, size_t off, uint64_t v)
+{
+    // Store via memcpy to be safe on unaligned addresses
+    uint64_t tmp = v;
+    __atomic_store_n(&tmp, tmp, __ATOMIC_RELAXED); // no-op but placates -O0
+    memcpy((uint8_t *)base + off, &tmp, sizeof(tmp));
+}
+static inline uint64_t u64_load_acq_unaligned(void *base, size_t off)
+{
+    uint64_t v;
+    memcpy(&v, (uint8_t *)base + off, sizeof(v));
+    return v;
+}
+
+// Futex-based Mutex wrapper over 64B header
 typedef struct
 {
-    PyObject_HEAD uint32_t *state;
+    PyObject_HEAD uint8_t *base; // points to start of 64B header
     int shared;
     PyObject *owner;
 } FutexMutex;
@@ -446,16 +515,18 @@ static int FutexMutex_init(FutexMutex *self, PyObject *args, PyObject *kw)
     Py_buffer view;
     if (PyObject_GetBuffer(buf_obj, &view, PyBUF_SIMPLE) < 0)
         return -1;
-    if (view.len < 4 || ((uintptr_t)view.buf % 4) != 0)
+    if (view.len < (Py_ssize_t)MUTEX64_SIZE || ((uintptr_t)view.buf % 4) != 0)
     {
         PyBuffer_Release(&view);
-        PyErr_SetString(PyExc_ValueError, "need 4-byte aligned >=4 buffer");
+        PyErr_SetString(PyExc_ValueError, "need 4-byte aligned >=64 buffer for Mutex");
         return -1;
     }
-    self->state = (uint32_t *)view.buf;
+    self->base = (uint8_t *)view.buf;
     self->shared = shared ? 1 : 0;
     self->owner = buf_obj;
     Py_INCREF(self->owner);
+    // set magic and clear reserved fields (idempotent)
+    u32_store_rel(self->base, MUTEX_OFF_MAGIC, MUTEX_MAGIC);
     PyBuffer_Release(&view);
     return 0;
 }
@@ -468,15 +539,16 @@ static void FutexMutex_dealloc(FutexMutex *self)
 
 static PyObject *FutexMutex_release(FutexMutex *self, PyObject *Py_UNUSED(ignored))
 {
-    _Atomic uint32_t *s = (_Atomic uint32_t *)self->state;
     // Set state to 0; wake exactly one waiter only if we observed contended state (2)
-    uint32_t prev = atomic_exchange_explicit(s, 0, memory_order_release);
+    uint32_t prev = u32_xchg_rel(self->base, MUTEX_OFF_STATE, 0);
+    // clear owner pid on release
+    u32_store_rel(self->base, MUTEX_OFF_OWNER, 0);
     if (prev == 2)
     {
         int op_wake = self->shared ? FUTEX_WAKE : FUTEX_WAKE_PRIVATE;
         int ret;
         Py_BEGIN_ALLOW_THREADS
-            ret = (int)syscall(SYS_futex, self->state, op_wake, 1, NULL, NULL, 0);
+            ret = (int)syscall(SYS_futex, (uint32_t *)(self->base + MUTEX_OFF_STATE), op_wake, 1, NULL, NULL, 0);
         Py_END_ALLOW_THREADS(void) ret;
     }
     // If prev was 1, we transitioned 1->0 with no waiters: nothing to wake.
@@ -484,13 +556,46 @@ static PyObject *FutexMutex_release(FutexMutex *self, PyObject *Py_UNUSED(ignore
     Py_RETURN_NONE;
 }
 
+static PyObject *FutexMutex_force_release(FutexMutex *self, PyObject *Py_UNUSED(ignored))
+{
+    // Forcibly clear the lock to unlocked state; wake one waiter if needed
+    uint32_t prev = u32_xchg_rel(self->base, MUTEX_OFF_STATE, 0);
+    u32_store_rel(self->base, MUTEX_OFF_OWNER, 0);
+    if (prev == 2)
+    {
+        int op_wake = self->shared ? FUTEX_WAKE : FUTEX_WAKE_PRIVATE;
+        int ret;
+        Py_BEGIN_ALLOW_THREADS
+            ret = (int)syscall(SYS_futex, (uint32_t *)(self->base + MUTEX_OFF_STATE), op_wake, 1, NULL, NULL, 0);
+        Py_END_ALLOW_THREADS(void) ret;
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *FutexMutex_owner_pid(FutexMutex *self, PyObject *Py_UNUSED(ignored))
+{
+    uint32_t v = u32_load_acq(self->base, MUTEX_OFF_OWNER);
+    return PyLong_FromUnsignedLong(v);
+}
+static PyObject *FutexMutex_last_acquired_ns(FutexMutex *self, PyObject *Py_UNUSED(ignored))
+{
+    uint64_t v = u64_load_acq_unaligned(self->base, MUTEX_OFF_LASTNS);
+    return PyLong_FromUnsignedLongLong(v);
+}
+static PyObject *FutexMutex_magic(FutexMutex *self, PyObject *Py_UNUSED(ignored))
+{
+    uint32_t v = u32_load_acq(self->base, MUTEX_OFF_MAGIC);
+    return PyLong_FromUnsignedLong(v);
+}
+
 // Fast-path helpers to avoid vararg parsing overhead
 static PyObject *FutexMutex_try_acquire(FutexMutex *self, PyObject *Py_UNUSED(ignored))
 {
-    _Atomic uint32_t *s = (_Atomic uint32_t *)self->state;
     uint32_t expected = 0;
-    if (atomic_compare_exchange_strong_explicit(s, &expected, 1, memory_order_acquire, memory_order_relaxed))
+    if (u32_cas_acqrel(self->base, MUTEX_OFF_STATE, &expected, 1))
     {
+        u32_store_rel(self->base, MUTEX_OFF_OWNER, (uint32_t)getpid());
+        u64_store_rel_unaligned(self->base, MUTEX_OFF_LASTNS, now_realtime_ns());
         Py_RETURN_TRUE;
     }
     Py_RETURN_FALSE;
@@ -498,48 +603,124 @@ static PyObject *FutexMutex_try_acquire(FutexMutex *self, PyObject *Py_UNUSED(ig
 
 static PyObject *FutexMutex_acquire_fast(FutexMutex *self, PyObject *Py_UNUSED(ignored))
 {
-    // Blocking acquire with adaptive spin, no arg parsing overhead
-    _Atomic uint32_t *s = (_Atomic uint32_t *)self->state;
     uint32_t expected = 0;
-    if (atomic_compare_exchange_strong_explicit(s, &expected, 1, memory_order_acquire, memory_order_relaxed))
+    if (u32_cas_acqrel(self->base, MUTEX_OFF_STATE, &expected, 1))
     {
+        u32_store_rel(self->base, MUTEX_OFF_OWNER, (uint32_t)getpid());
+        u64_store_rel_unaligned(self->base, MUTEX_OFF_LASTNS, now_realtime_ns());
         Py_RETURN_TRUE;
     }
     int op_wait = self->shared ? FUTEX_WAIT : FUTEX_WAIT_PRIVATE;
     for (;;)
     {
-        uint32_t c = atomic_exchange_explicit(s, 2, memory_order_acquire);
+        uint32_t c = atomic_exchange_explicit((_Atomic uint32_t *)(self->base + MUTEX_OFF_STATE), 2, memory_order_acquire);
         if (c == 0)
             break;
         int ret;
         Py_BEGIN_ALLOW_THREADS
-            ret = (int)syscall(SYS_futex, self->state, op_wait, 2, NULL, NULL, 0);
+            ret = (int)syscall(SYS_futex, (uint32_t *)(self->base + MUTEX_OFF_STATE), op_wait, 2, NULL, NULL, 0);
         Py_END_ALLOW_THREADS(void) ret;
-        blocked = 1;
     }
+    // We now hold the lock with state=2 (contended). Keep it 2 to preserve waiter flag.
+    u32_store_rel(self->base, MUTEX_OFF_OWNER, (uint32_t)getpid());
+    u64_store_rel_unaligned(self->base, MUTEX_OFF_LASTNS, now_realtime_ns());
+    Py_RETURN_TRUE;
+}
+
+static PyObject *FutexMutex_acquire_ns(FutexMutex *self, PyObject *args, PyObject *kw)
+{
+    static char *kwlist[] = {"timeout_ns", "spin", NULL};
+    long long timeout_ns = -1;
+    int spin = 16;
+    if (!PyArg_ParseTupleAndKeywords(args, kw, "|Li", kwlist, &timeout_ns, &spin))
+        return NULL;
+
+    uint32_t expected = 0;
+    if (u32_cas_acqrel(self->base, MUTEX_OFF_STATE, &expected, 1))
+    {
+        u32_store_rel(self->base, MUTEX_OFF_OWNER, (uint32_t)getpid());
+        u64_store_rel_unaligned(self->base, MUTEX_OFF_LASTNS, now_realtime_ns());
+        Py_RETURN_TRUE;
+    }
+    // spin a bit
+    for (int i = 0; i < spin; i++)
+    {
+        uint32_t v = u32_load_acq(self->base, MUTEX_OFF_STATE);
+        if (v == 0)
+        {
+            uint32_t e2 = 0;
+            if (atomic_compare_exchange_weak_explicit((_Atomic uint32_t *)(self->base + MUTEX_OFF_STATE), &e2, 1, memory_order_acquire, memory_order_relaxed))
+            {
+                u32_store_rel(self->base, MUTEX_OFF_OWNER, (uint32_t)getpid());
+                u64_store_rel_unaligned(self->base, MUTEX_OFF_LASTNS, now_realtime_ns());
+                Py_RETURN_TRUE;
+            }
+        }
+        CPU_RELAX();
+    }
+    if (timeout_ns == 0)
+        Py_RETURN_FALSE;
+
+    struct timespec ts, *pts = NULL;
+    if (timeout_ns > 0)
+    {
+        ts.tv_sec = timeout_ns / 1000000000LL;
+        ts.tv_nsec = timeout_ns % 1000000000LL;
+        pts = &ts;
+    }
+    int op_wait = self->shared ? FUTEX_WAIT : FUTEX_WAIT_PRIVATE;
+    for (;;)
+    {
+        uint32_t c = atomic_exchange_explicit((_Atomic uint32_t *)(self->base + MUTEX_OFF_STATE), 2, memory_order_acquire);
+        if (c == 0)
+            break;
+        int ret, err;
+        Py_BEGIN_ALLOW_THREADS
+            ret = (int)syscall(SYS_futex, (uint32_t *)(self->base + MUTEX_OFF_STATE), op_wait, 2, pts, NULL, 0);
+        err = errno;
+        Py_END_ALLOW_THREADS
+        if (ret == -1)
+        {
+            if (err == ETIMEDOUT)
+                Py_RETURN_FALSE;
+            if (err == EINTR)
+            {
+                if (pts != NULL)
+                    Py_RETURN_FALSE;
+                continue;
+            }
+        }
+        // otherwise, loop (spurious wake tolerated)
+    }
+    // Keep state=2 (contended) to ensure release will wake waiters.
+    u32_store_rel(self->base, MUTEX_OFF_OWNER, (uint32_t)getpid());
+    u64_store_rel_unaligned(self->base, MUTEX_OFF_LASTNS, now_realtime_ns());
     Py_RETURN_TRUE;
 }
 
 static PyObject *FutexMutex_enter(FutexMutex *self, PyObject *Py_UNUSED(ignored))
 {
     // Inline blocking acquire to avoid calling a METH_VARARGS function directly
-    _Atomic uint32_t *s = (_Atomic uint32_t *)self->state;
     uint32_t expected = 0;
-    if (atomic_compare_exchange_strong_explicit(s, &expected, 1, memory_order_acquire, memory_order_relaxed))
+    if (u32_cas_acqrel(self->base, MUTEX_OFF_STATE, &expected, 1))
     {
         Py_INCREF(self);
+        u32_store_rel(self->base, MUTEX_OFF_OWNER, (uint32_t)getpid());
+        u64_store_rel_unaligned(self->base, MUTEX_OFF_LASTNS, now_realtime_ns());
         return (PyObject *)self;
     }
     // small default spin before sleep
     for (int i = 0; i < 16; i++)
     {
-        uint32_t v = atomic_load_explicit(s, memory_order_acquire);
+        uint32_t v = u32_load_acq(self->base, MUTEX_OFF_STATE);
         if (v == 0)
         {
             uint32_t exp2 = 0;
-            if (atomic_compare_exchange_weak_explicit(s, &exp2, 1, memory_order_acquire, memory_order_relaxed))
+            if (atomic_compare_exchange_weak_explicit((_Atomic uint32_t *)(self->base + MUTEX_OFF_STATE), &exp2, 1, memory_order_acquire, memory_order_relaxed))
             {
                 Py_INCREF(self);
+                u32_store_rel(self->base, MUTEX_OFF_OWNER, (uint32_t)getpid());
+                u64_store_rel_unaligned(self->base, MUTEX_OFF_LASTNS, now_realtime_ns());
                 return (PyObject *)self;
             }
         }
@@ -549,16 +730,19 @@ static PyObject *FutexMutex_enter(FutexMutex *self, PyObject *Py_UNUSED(ignored)
     int c;
     for (;;)
     {
-        c = atomic_exchange_explicit(s, 2, memory_order_acquire);
+        c = atomic_exchange_explicit((_Atomic uint32_t *)(self->base + MUTEX_OFF_STATE), 2, memory_order_acquire);
         if (c == 0)
             break;
         int ret, err;
         Py_BEGIN_ALLOW_THREADS
-            ret = (int)syscall(SYS_futex, self->state, op_wait, 2, NULL, NULL, 0);
+            ret = (int)syscall(SYS_futex, (uint32_t *)(self->base + MUTEX_OFF_STATE), op_wait, 2, NULL, NULL, 0);
         err = errno;
         Py_END_ALLOW_THREADS(void) ret;
         (void)err;
     }
+    // Keep state=2 (contended) to ensure release will wake waiters.
+    u32_store_rel(self->base, MUTEX_OFF_OWNER, (uint32_t)getpid());
+    u64_store_rel_unaligned(self->base, MUTEX_OFF_LASTNS, now_realtime_ns());
     Py_INCREF(self);
     return (PyObject *)self;
 }
@@ -569,8 +753,13 @@ static PyObject *FutexMutex_exit(FutexMutex *self, PyObject *Py_UNUSED(args))
 
 static PyMethodDef FutexMutex_methods[] = {
     {"acquire", (PyCFunction)FutexMutex_acquire_fast, METH_NOARGS, "acquire the mutex (blocking)"},
+    {"acquire_ns", PyCFunction_CAST(FutexMutex_acquire_ns), METH_VARARGS | METH_KEYWORDS, "acquire with timeout_ns and spin; returns bool"},
     {"release", (PyCFunction)FutexMutex_release, METH_NOARGS, "release the mutex"},
+    {"force_release", (PyCFunction)FutexMutex_force_release, METH_NOARGS, "forcibly unlock the mutex"},
     {"try_acquire", (PyCFunction)FutexMutex_try_acquire, METH_NOARGS, "nonblocking acquire"},
+    {"owner_pid", (PyCFunction)FutexMutex_owner_pid, METH_NOARGS, "current owner PID or 0"},
+    {"last_acquired_ns", (PyCFunction)FutexMutex_last_acquired_ns, METH_NOARGS, "last successful acquisition time (ns)"},
+    {"magic", (PyCFunction)FutexMutex_magic, METH_NOARGS, "Get magic constant"},
     {"__enter__", (PyCFunction)FutexMutex_enter, METH_NOARGS, "ctx enter"},
     {"__exit__", (PyCFunction)FutexMutex_exit, METH_VARARGS, "ctx exit"},
     {NULL, NULL, 0, NULL}};
@@ -578,7 +767,10 @@ static PyMethodDef FutexMutex_methods[] = {
 static PyObject *FutexMutex_repr(PyObject *self)
 {
     FutexMutex *s = (FutexMutex *)self;
-    return PyUnicode_FromFormat("<fastipc.Mutex addr=%p shared=%d>", (void *)s->state, s->shared);
+    uint32_t owner = u32_load_acq(s->base, MUTEX_OFF_OWNER);
+    uint64_t ts = u64_load_acq_unaligned(s->base, MUTEX_OFF_LASTNS);
+    uint32_t st = u32_load_acq(s->base, MUTEX_OFF_STATE);
+    return PyUnicode_FromFormat("<fastipc.Mutex buf=%p shared=%d state=%u owner=%u last_ns=%llu>", (void *)s->base, s->shared, (unsigned)st, (unsigned)owner, (unsigned long long)ts);
 }
 
 static PyTypeObject FutexMutexType = {
@@ -593,10 +785,10 @@ static PyTypeObject FutexMutexType = {
     .tp_repr = (reprfunc)FutexMutex_repr,
 };
 
-// Futex-based counting semaphore
+// Futex-based counting semaphore with 64B header
 typedef struct
 {
-    PyObject_HEAD uint32_t *count;
+    PyObject_HEAD uint8_t *base; // start of 64B header
     int shared;
     PyObject *owner;
 } FutexSemaphore;
@@ -612,16 +804,18 @@ static int FutexSemaphore_init(FutexSemaphore *self, PyObject *args, PyObject *k
     Py_buffer view;
     if (PyObject_GetBuffer(buf_obj, &view, PyBUF_SIMPLE) < 0)
         return -1;
-    if (view.len < 4 || ((uintptr_t)view.buf % 4) != 0)
+    if (view.len < (Py_ssize_t)SEM64_SIZE || ((uintptr_t)view.buf % 4) != 0)
     {
         PyBuffer_Release(&view);
-        PyErr_SetString(PyExc_ValueError, "need 4-byte aligned >=4 buffer");
+        PyErr_SetString(PyExc_ValueError, "need 4-byte aligned >=64 buffer for Semaphore");
         return -1;
     }
-    self->count = (uint32_t *)view.buf;
+    self->base = (uint8_t *)view.buf;
     self->shared = shared ? 1 : 0;
     self->owner = buf_obj;
     Py_INCREF(self->owner);
+    // Initialize magic and, if requested, initial count
+    u32_store_rel(self->base, SEM_OFF_MAGIC, SEM_MAGIC);
     // Initialize only if an explicit initial value is provided (not None)
     if (init_obj && init_obj != Py_None)
     {
@@ -638,7 +832,7 @@ static int FutexSemaphore_init(FutexSemaphore *self, PyObject *args, PyObject *k
             return -1;
         }
         uint32_t init = (uint32_t)init_ul;
-        atomic_store_explicit((_Atomic uint32_t *)self->count, init, memory_order_release);
+        atomic_store_explicit((_Atomic uint32_t *)(self->base + SEM_OFF_COUNT), init, memory_order_release);
     }
     PyBuffer_Release(&view);
     return 0;
@@ -656,7 +850,7 @@ static PyObject *FutexSemaphore_post(FutexSemaphore *self, PyObject *args, PyObj
     unsigned int n = 1;
     if (!PyArg_ParseTupleAndKeywords(args, kw, "|I", kwlist, &n))
         return NULL;
-    _Atomic uint32_t *c = (_Atomic uint32_t *)self->count;
+    _Atomic uint32_t *c = (_Atomic uint32_t *)(self->base + SEM_OFF_COUNT);
     uint32_t prev = atomic_fetch_add_explicit(c, n, memory_order_release);
     if (prev == 0)
     {
@@ -664,7 +858,7 @@ static PyObject *FutexSemaphore_post(FutexSemaphore *self, PyObject *args, PyObj
         int wake_n = (int)n;
         int ret;
         Py_BEGIN_ALLOW_THREADS
-            ret = (int)syscall(SYS_futex, self->count, op_wake, wake_n, NULL, NULL, 0);
+            ret = (int)syscall(SYS_futex, (uint32_t *)(self->base + SEM_OFF_COUNT), op_wake, wake_n, NULL, NULL, 0);
         Py_END_ALLOW_THREADS(void) ret;
     }
     Py_RETURN_NONE;
@@ -672,14 +866,14 @@ static PyObject *FutexSemaphore_post(FutexSemaphore *self, PyObject *args, PyObj
 
 static PyObject *__attribute__((unused)) FutexSemaphore_post1(FutexSemaphore *self, PyObject *Py_UNUSED(ignored))
 {
-    _Atomic uint32_t *c = (_Atomic uint32_t *)self->count;
+    _Atomic uint32_t *c = (_Atomic uint32_t *)(self->base + SEM_OFF_COUNT);
     uint32_t prev = atomic_fetch_add_explicit(c, 1, memory_order_release);
     if (prev == 0)
     {
         int op_wake = self->shared ? FUTEX_WAKE : FUTEX_WAKE_PRIVATE;
         int ret;
         Py_BEGIN_ALLOW_THREADS
-            ret = (int)syscall(SYS_futex, self->count, op_wake, 1, NULL, NULL, 0);
+            ret = (int)syscall(SYS_futex, (uint32_t *)(self->base + SEM_OFF_COUNT), op_wake, 1, NULL, NULL, 0);
         Py_END_ALLOW_THREADS(void) ret;
     }
     Py_RETURN_NONE;
@@ -693,7 +887,7 @@ static PyObject *FutexSemaphore_wait(FutexSemaphore *self, PyObject *args, PyObj
     int spin = 16;
     if (!PyArg_ParseTupleAndKeywords(args, kw, "|pLi", kwlist, &blocking, &timeout_ns, &spin))
         return NULL;
-    _Atomic uint32_t *c = (_Atomic uint32_t *)self->count;
+    _Atomic uint32_t *c = (_Atomic uint32_t *)(self->base + SEM_OFF_COUNT);
     struct timespec ts, *pts = NULL;
     if (timeout_ns >= 0)
     {
@@ -712,6 +906,8 @@ static PyObject *FutexSemaphore_wait(FutexSemaphore *self, PyObject *args, PyObj
                 uint32_t vv = v;
                 if (atomic_compare_exchange_weak_explicit(c, &vv, vv - 1, memory_order_acq_rel, memory_order_acquire))
                 {
+                    u32_store_rel(self->base, SEM_OFF_LASTPID, (uint32_t)getpid());
+                    u64_store_rel_unaligned(self->base, SEM_OFF_LASTNS, now_realtime_ns());
                     Py_RETURN_TRUE;
                 }
             }
@@ -722,7 +918,7 @@ static PyObject *FutexSemaphore_wait(FutexSemaphore *self, PyObject *args, PyObj
         int op_wait = self->shared ? FUTEX_WAIT : FUTEX_WAIT_PRIVATE;
         int ret, err;
         Py_BEGIN_ALLOW_THREADS
-            ret = (int)syscall(SYS_futex, self->count, op_wait, 0, pts, NULL, 0);
+            ret = (int)syscall(SYS_futex, (uint32_t *)(self->base + SEM_OFF_COUNT), op_wait, 0, pts, NULL, 0);
         err = errno;
         Py_END_ALLOW_THREADS if (ret == -1 && err == ETIMEDOUT) Py_RETURN_FALSE;
         // else loop (spurious wake-ups tolerated)
@@ -732,14 +928,14 @@ static PyObject *FutexSemaphore_wait(FutexSemaphore *self, PyObject *args, PyObj
 // Not exported: kept for potential future tuning
 static PyObject *__attribute__((unused)) FutexSemaphore_wait_fast(FutexSemaphore *self, PyObject *Py_UNUSED(ignored))
 {
-    _Atomic uint32_t *c = (_Atomic uint32_t *)self->count;
+    _Atomic uint32_t *c = (_Atomic uint32_t *)(self->base + SEM_OFF_COUNT);
     int blocked = 0;
     for (;;)
     {
         int op_wait = self->shared ? FUTEX_WAIT : FUTEX_WAIT_PRIVATE;
         int ret;
         Py_BEGIN_ALLOW_THREADS
-            ret = (int)syscall(SYS_futex, self->count, op_wait, 0, NULL, NULL, 0);
+            ret = (int)syscall(SYS_futex, (uint32_t *)(self->base + SEM_OFF_COUNT), op_wait, 0, NULL, NULL, 0);
         Py_END_ALLOW_THREADS(void) ret;
         blocked = 1;
     }
@@ -747,7 +943,23 @@ static PyObject *__attribute__((unused)) FutexSemaphore_wait_fast(FutexSemaphore
 
 static PyObject *FutexSemaphore_value(FutexSemaphore *self, PyObject *Py_UNUSED(ignored))
 {
-    uint32_t v = atomic_load_explicit((_Atomic uint32_t *)self->count, memory_order_acquire);
+    uint32_t v = atomic_load_explicit((_Atomic uint32_t *)(self->base + SEM_OFF_COUNT), memory_order_acquire);
+    return PyLong_FromUnsignedLong(v);
+}
+
+static PyObject *FutexSemaphore_last_acquired_ns(FutexSemaphore *self, PyObject *Py_UNUSED(ignored))
+{
+    uint64_t v = u64_load_acq_unaligned(self->base, SEM_OFF_LASTNS);
+    return PyLong_FromUnsignedLongLong(v);
+}
+static PyObject *FutexSemaphore_last_pid(FutexSemaphore *self, PyObject *Py_UNUSED(ignored))
+{
+    uint32_t v = u32_load_acq(self->base, SEM_OFF_LASTPID);
+    return PyLong_FromUnsignedLong(v);
+}
+static PyObject *FutexSemaphore_magic(FutexSemaphore *self, PyObject *Py_UNUSED(ignored))
+{
+    uint32_t v = u32_load_acq(self->base, SEM_OFF_MAGIC);
     return PyLong_FromUnsignedLong(v);
 }
 
@@ -756,13 +968,18 @@ static PyMethodDef FutexSemaphore_methods[] = {
     {"post1", PyCFunction_CAST(FutexSemaphore_post1), METH_VARARGS | METH_KEYWORDS, "Increment one and possibly wake waiters"},
     {"wait", PyCFunction_CAST(FutexSemaphore_wait), METH_VARARGS | METH_KEYWORDS, "Decrement or block until available"},
     {"value", (PyCFunction)FutexSemaphore_value, METH_NOARGS, "Get current value"},
+    {"last_acquired_ns", (PyCFunction)FutexSemaphore_last_acquired_ns, METH_NOARGS, "Get last successful wait time (ns)"},
+    {"last_pid", (PyCFunction)FutexSemaphore_last_pid, METH_NOARGS, "Get last successful waiter PID"},
+    {"magic", (PyCFunction)FutexSemaphore_magic, METH_NOARGS, "Get magic constant"},
     {NULL, NULL, 0, NULL}};
 
 static PyObject *FutexSemaphore_repr(PyObject *self)
 {
     FutexSemaphore *s = (FutexSemaphore *)self;
-    uint32_t v = atomic_load_explicit((_Atomic uint32_t *)s->count, memory_order_acquire);
-    return PyUnicode_FromFormat("<fastipc.Semaphore addr=%p shared=%d value=%u>", (void *)s->count, s->shared, (unsigned)v);
+    uint32_t v = atomic_load_explicit((_Atomic uint32_t *)(s->base + SEM_OFF_COUNT), memory_order_acquire);
+    uint32_t pid = u32_load_acq(s->base, SEM_OFF_LASTPID);
+    uint64_t ts = u64_load_acq_unaligned(s->base, SEM_OFF_LASTNS);
+    return PyUnicode_FromFormat("<fastipc.Semaphore buf=%p shared=%d value=%u last_pid=%u last_ns=%llu>", (void *)s->base, s->shared, (unsigned)v, (unsigned)pid, (unsigned long long)ts);
 }
 
 static PyTypeObject FutexSemaphoreType = {

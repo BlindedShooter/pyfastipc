@@ -16,7 +16,7 @@ class NamedEvent:
 
         :param name: The name of the event.
         """
-        self._shm = GuardedSharedMemory(f"__pyfastipc_{name}", size=4)
+        self._shm = GuardedSharedMemory(f"__pyfastipc_event_{name}", size=4)
         self._name = name
         self._futex = FutexWord(self._shm.buf, shared=True)
         self._futex.store_release(0)

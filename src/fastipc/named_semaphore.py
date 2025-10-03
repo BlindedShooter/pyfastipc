@@ -6,8 +6,15 @@ from fastipc.guarded_shared_memory import GuardedSharedMemory
 
 class NamedSemaphore:
     """
-    A named semaphore that uses a shared memory segment to track the semaphore state.
-    This class is designed to be used across different processes.
+    A named, cross-process semaphore backed by a 64-byte shared-memory header.
+
+    Layout (SEMA):
+    - magic: 'SEMA' at offset 0x00
+    - count: futex word at offset 0x08
+    - last_pid: PID of last successful waiter at 0x0C
+    - last_acquired_ns: CLOCK_REALTIME (ns) of last successful wait at 0x10
+
+    Exposed helpers: last_pid(), last_acquired_ns().
     """
 
     def __init__(
@@ -16,16 +23,25 @@ class NamedSemaphore:
         initial: int | None = None,
     ):
         """
-        Initialize the NamedSemaphore with a shared memory segment.
+        Create or attach a 64B shared-memory header for this semaphore.
 
-        :param name: The name of the semaphore.
-        :param initial: The initial value of the semaphore.
+        :param name: Symbolic name for the shared memory region.
+        :param initial: Initial count if we created the segment (attach-only otherwise).
         """
-        self._shm = GuardedSharedMemory(f"__pyfastipc_{name}", size=4)
+        self._shm = GuardedSharedMemory(f"__pyfastipc_sema_{name}", size=64)
         self._name = name
         # Only set initial value if we created the backing segment
         init_val = initial if getattr(self._shm, "created", False) else None
         self._semaphore = Semaphore(self._shm.buf, initial=init_val, shared=True)
+
+    # Metadata helpers
+    def last_acquired_ns(self) -> int:
+        """Return CLOCK_REALTIME nanoseconds of the last successful wait."""
+        return int(self._semaphore.last_acquired_ns())
+
+    def last_pid(self) -> int:
+        """Return PID of the last process/thread that acquired a token."""
+        return int(self._semaphore.last_pid())
 
     def post(self, n: int = 1) -> None:
         """
