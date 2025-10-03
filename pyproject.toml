@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=78", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastipc"
+version = "0.1.0"
+description = "Linux futex-based primitives (C extension)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE",]
+authors = [{ name = "JihunLee", email = "gkadnflh@gmail.com" }]
+classifiers = [
+  "LICENSE :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: C"
+]
+
+[project.urls]
+Homepage = "https://github.com/BlindedShooter/fastipc"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.cibuildwheel]
+# Build CPython wheels for Linux only; PyPy and non-Linux are skipped.
+build = [
+  "cp39-*",
+  "cp310-*",
+  "cp311-*",
+  "cp312-*",
+  "cp313-*",
+]
+skip = ["pp*", "*-win32", "*-macosx*"]
+
+[tool.cibuildwheel.linux]
+archs = ["x86_64", "aarch64"]
+# Keep default compiler flags from setup.py; avoid -march=native for wheel portability.
+test-command = [
+  "python - <<'PY'\nfrom array import array\nfrom fastipc import Mutex\nm = Mutex(memoryview(array('I',[0])))\nassert m.acquire(); m.release()\nprint('fastipc wheel sanity OK')\nPY",
+]
+# Modern images; adjust if you need older glibc compatibility.
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+musllinux-x86_64-image = "musllinux_1_2"
+musllinux-aarch64-image = "musllinux_1_2"
