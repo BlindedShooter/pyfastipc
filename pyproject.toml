@@ -25,9 +25,9 @@ test = [
 ]
 
 [project.urls]
-homepage = "https://github.com/BlindedShooter/fastipc"
-repository = "https://github.com/BlindedShooter/fastipc"
-Issues = "https://github.com/BlindedShooter/fastipc/issues"
+homepage = "https://github.com/BlindedShooter/pyfastipc"
+repository = "https://github.com/BlindedShooter/pyfastipc"
+Issues = "https://github.com/BlindedShooter/pyfastipc/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -41,7 +41,7 @@ build = [
   "cp312-*",
   "cp313-*",
 ]
-skip = ["pp*", "*-win32", "*-macosx*"]
+skip = ["pp*", "*-aarch64", "*-win32", "*-macosx*"]
 
 [tool.cibuildwheel.linux]
 archs = ["x86_64", "aarch64"]
