@@ -3,7 +3,7 @@ fastipc — Fast Machine-level Sync for Python
 
 Fast IPC synchronization primitives in C11/CPython extension, with:
 - Explicit acquire/release semantics and a focus on latency and throughput. 
-- Primitives operate on caller-supplied buffer (thus machine-level)
+- Primitives operate on caller-supplied buffer (thus **machine-level**)
 - Comes with Named helpers for easier usage out of the box.
 
 Status: Linux-only (futex backed). Python >= 3.9. Targets x86_64 and other Linux archs.
