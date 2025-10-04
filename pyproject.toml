@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fastipc"
-version = "0.1.0"
+version = "0.1.1"
 description = "Linux futex-based primitives (C extension)"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -44,7 +44,7 @@ build = [
 skip = ["pp*", "*-aarch64", "*-win32", "*-macosx*"]
 
 [tool.cibuildwheel.linux]
-archs = ["x86_64", "aarch64"]
+archs = ["x86_64",]
 # Keep default compiler flags from setup.py; avoid -march=native for wheel portability.
 test-command = [
   "python - <<'PY'\nfrom fastipc import Mutex\nm = Mutex(memoryview(bytearray(64)))\nassert m.acquire(); m.release()\nprint('fastipc wheel sanity OK')\nPY",
