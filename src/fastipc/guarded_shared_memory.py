@@ -85,6 +85,10 @@ def _shm_unlink_wrapped(name: bytes) -> None:
     raise OSError(err, os.strerror(err))
 
 
+class NoShmFoundError(Exception):
+    pass
+
+
 class GuardedSharedMemory:
     """
     attach or create a shared memory segment with PID tracking.
@@ -96,6 +100,7 @@ class GuardedSharedMemory:
         self,
         name: str,
         size: int,
+        attach_only: bool = False,
         *,
         pid_dir: str = "/dev/shm/fastipc",
         max_attempts: int = 128,
@@ -110,9 +115,12 @@ class GuardedSharedMemory:
         Args:
             name: The name of the shared memory segment.
             size: The size of the shared memory segment.
-            base_dir: The base directory for PID files.
+            attach_only: Whether to only attach to an existing shared memory segment. Raise an error if the segment does not exist.
+            *
+            pid_dir: The base directory for PID files.
             max_attempts: The maximum number of attempts to create/attach the segment.
             backoff_base: The base backoff time (in seconds) for retrying failed attempts.
+            try_cleanup_on_exit: Whether to attempt cleanup on object deletion or program exit.
         """
         if size <= 0:
             raise ValueError("size must be a positive integer")
@@ -150,7 +158,11 @@ class GuardedSharedMemory:
             try:
                 try:
                     fd = _shm_open_wrapped(self._posix_name_b, os.O_RDWR, 0o600)
-                except FileNotFoundError:
+                except FileNotFoundError as e:
+                    if attach_only:
+                        raise NoShmFoundError(
+                            f"Shared memory segment '{name}' does not exist"
+                        ) from e
                     fd = _shm_open_wrapped(
                         self._posix_name_b,
                         os.O_RDWR | os.O_CREAT | os.O_EXCL,
