@@ -8,7 +8,7 @@ import pytest
 if sys.platform != "linux":
     pytest.skip("Linux-only futex tests", allow_module_level=True)
 
-from fastipc import Semaphore  # type: ignore
+from fastipc._primitives import Semaphore  # type: ignore
 
 
 @pytest.mark.timeout(5)

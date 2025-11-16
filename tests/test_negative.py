@@ -1,7 +1,7 @@
 import sys
 import pytest
 
-from fastipc import Mutex, Semaphore, FutexWord  # type: ignore
+from fastipc._primitives import Mutex, Semaphore, FutexWord  # type: ignore
 
 if sys.platform != "linux":
     pytest.skip("Linux-only futex tests", allow_module_level=True)

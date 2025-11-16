@@ -7,7 +7,7 @@ import pytest
 if sys.platform != "linux":
     pytest.skip("Linux-only futex tests", allow_module_level=True)
 
-from fastipc import AtomicU32, AtomicU64  # type: ignore
+from fastipc._primitives import AtomicU32, AtomicU64  # type: ignore
 
 
 @pytest.mark.timeout(10)
