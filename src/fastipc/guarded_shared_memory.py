@@ -100,6 +100,7 @@ class GuardedSharedMemory:
         pid_dir: str = "/dev/shm/fastipc",
         max_attempts: int = 128,
         backoff_base: float = 0.002,
+        try_cleanup_on_exit: bool = True,
     ) -> None:
         """
         Initialize a guarded shared memory segment.
@@ -126,6 +127,7 @@ class GuardedSharedMemory:
         self._name = name
         self._posix_name = f"/{name}"
         self._posix_name_b = self._posix_name.encode("utf-8")
+        self._try_cleanup_on_exit = try_cleanup_on_exit
 
         self._pid = os.getpid()
         self._size = size
@@ -201,7 +203,9 @@ class GuardedSharedMemory:
                 f"Failed to attach/create shm '{name}' after {max_attempts} attempts"
             ) from last_err
 
-        atexit.register(self.close)
+        if self._try_cleanup_on_exit:
+            atexit.register(self.close)
+        
         with open(f"{self._pdir}/{self._pid}", "w"):
             pass
 
@@ -258,14 +262,12 @@ class GuardedSharedMemory:
         self.close()
 
     def __del__(self) -> None:
-        try:
-            self.close()
-        except Exception:
-            pass
-        try:
-            atexit.unregister(self.close)  # type: ignore[attr-defined]
-        except Exception:
-            pass
+        if self._try_cleanup_on_exit:
+            try:
+                self.close()
+            except Exception:
+                pass
+        self._unregister_atexit()
 
     @property
     def buf(self) -> memoryview:
@@ -287,7 +289,7 @@ class GuardedSharedMemory:
                 if fn.isdigit() and not _alive(int(fn)):
                     try:
                         os.unlink(f"{self._pdir}/{fn}")
-                    except FileNotFoundError:
+                    except Exception:
                         pass
         except FileNotFoundError:
             pass
@@ -330,6 +332,8 @@ class GuardedSharedMemory:
             self._fd = None
 
     def _unregister_atexit(self) -> None:
+        if not self._try_cleanup_on_exit:
+            return
         try:
             atexit.unregister(self.close)
         except Exception:

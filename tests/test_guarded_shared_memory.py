@@ -83,3 +83,24 @@ def test_pid_tracking_get_num_procs_benchmark(benchmark, tmp_path, monkeypatch):
         p.join(timeout=5)
         assert p.exitcode == 0
         parent.close()
+
+
+def test_consistency_with_auto_cleanup_disabled(tmp_path, monkeypatch):
+    """Verify that with auto-cleanup disabled, PID dir remains after close."""
+    pid_root = tmp_path / "pids_root2"
+    monkeypatch.setenv("FASTIPC_PID_DIR", str(pid_root))
+
+    name = f"test_no_cleanup_{os.getpid()}_{int(time.time()*1e6)}"
+    shm = GuardedSharedMemory(name, size=64, try_cleanup_on_exit=False)
+    assert shm.created is True
+    pdir = pid_root / f"{name}.pids"
+    assert pdir.is_dir()
+    files = list(pdir.iterdir())
+    assert any(f.name == str(os.getpid()) for f in files if f.name.isdigit())
+    del shm
+    
+    # Try to attach again on same name; should succeed
+    shm2 = GuardedSharedMemory(name, size=64, try_cleanup_on_exit=True)
+    assert shm2.created is False
+    shm2.close()
+    assert not pdir.exists()
