@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import atexit
+
 from fastipc._primitives import Mutex
 from fastipc.guarded_shared_memory import GuardedSharedMemory
 
@@ -25,13 +27,14 @@ class NamedMutex:
         """
         self._name = name
         self._shm = GuardedSharedMemory(f"__pyfastipc_mutex_{name}", size=64)
+        self._mutex = Mutex(self._shm.buf, shared=True)
         # Initialize header only if we created the backing segment
-        if getattr(self._shm, "created", False):
+        if getattr(self._shm, "created", True):
             try:
+                self._mutex.force_release()  # ensure initialized
                 self._shm.buf[:64] = b"\x00" * 64
             except Exception:
                 pass
-        self._mutex = Mutex(self._shm.buf, shared=True)
 
     def acquire(self) -> bool:
         """
@@ -66,6 +69,19 @@ class NamedMutex:
         Release the mutex, making it available for other processes.
         """
         self._mutex.release()
+    
+    def try_release(self) -> bool:
+        """
+        Try to release the mutex.
+
+        Returns:
+            True if the mutex was released, False if the caller is not the owner.
+        """
+        try:
+            self._mutex.release()
+            return True
+        except RuntimeError:
+            return False
 
     def force_release(self) -> None:
         """

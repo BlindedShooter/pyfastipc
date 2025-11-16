@@ -540,10 +540,18 @@ static void FutexMutex_dealloc(FutexMutex *self)
 
 static PyObject *FutexMutex_release(FutexMutex *self, PyObject *Py_UNUSED(ignored))
 {
+    // check owner pid and release only if we own the lock
+    if (u32_load_acq(self->base, MUTEX_OFF_OWNER) != (uint32_t)getpid())
+    {
+        PyErr_SetString(PyExc_RuntimeError, "cannot release a mutex not owned by this process");
+        return NULL;
+    }
+
     // Set state to 0; wake exactly one waiter only if we observed contended state (2)
     uint32_t prev = u32_xchg_rel(self->base, MUTEX_OFF_STATE, 0);
-    // clear owner pid on release
+    // Clear owner
     u32_store_rel(self->base, MUTEX_OFF_OWNER, 0);
+
     if (prev == 2)
     {
         int op_wake = self->shared ? FUTEX_WAKE : FUTEX_WAKE_PRIVATE;
@@ -553,7 +561,7 @@ static PyObject *FutexMutex_release(FutexMutex *self, PyObject *Py_UNUSED(ignore
         Py_END_ALLOW_THREADS(void) ret;
     }
     // If prev was 1, we transitioned 1->0 with no waiters: nothing to wake.
-    // If prev was 0, double-release: treat as no-op.
+    // If prev was 0, double-release: treat as no-op. (actually should not happen due to owner check above)
     Py_RETURN_NONE;
 }
 
@@ -561,6 +569,8 @@ static PyObject *FutexMutex_force_release(FutexMutex *self, PyObject *Py_UNUSED(
 {
     // Forcibly clear the lock to unlocked state; wake one waiter if needed
     uint32_t prev = u32_xchg_rel(self->base, MUTEX_OFF_STATE, 0);
+
+    // Clear owner unconditionally
     u32_store_rel(self->base, MUTEX_OFF_OWNER, 0);
     if (prev == 2)
     {
@@ -605,12 +615,21 @@ static PyObject *FutexMutex_try_acquire(FutexMutex *self, PyObject *Py_UNUSED(ig
 static PyObject *FutexMutex_acquire_fast(FutexMutex *self, PyObject *Py_UNUSED(ignored))
 {
     uint32_t expected = 0;
+
+    // Check owner pid and raise if we already own the lock
+    if (u32_load_acq(self->base, MUTEX_OFF_OWNER) == (uint32_t)getpid())
+    {
+        PyErr_SetString(PyExc_RuntimeError, "cannot re-acquire a mutex already owned by this process");
+        return NULL;
+    }
+
     if (u32_cas_acqrel(self->base, MUTEX_OFF_STATE, &expected, 1))
     {
         u32_store_rel(self->base, MUTEX_OFF_OWNER, (uint32_t)getpid());
         u64_store_rel_unaligned(self->base, MUTEX_OFF_LASTNS, now_realtime_ns());
         Py_RETURN_TRUE;
     }
+
     int op_wait = self->shared ? FUTEX_WAIT : FUTEX_WAIT_PRIVATE;
     for (;;)
     {
@@ -679,8 +698,7 @@ static PyObject *FutexMutex_acquire_ns(FutexMutex *self, PyObject *args, PyObjec
         Py_BEGIN_ALLOW_THREADS
             ret = (int)syscall(SYS_futex, (uint32_t *)(self->base + MUTEX_OFF_STATE), op_wait, 2, pts, NULL, 0);
         err = errno;
-        Py_END_ALLOW_THREADS
-        if (ret == -1)
+        Py_END_ALLOW_THREADS if (ret == -1)
         {
             if (err == ETIMEDOUT)
                 Py_RETURN_FALSE;
@@ -885,7 +903,7 @@ static void semaphore_wake_waiters(FutexSemaphore *self, uint32_t prev, uint32_t
     int ret;
     Py_BEGIN_ALLOW_THREADS
         ret = (int)syscall(SYS_futex, (uint32_t *)(self->base + SEM_OFF_COUNT), op_wake, wake_n, NULL, NULL, 0);
-    Py_END_ALLOW_THREADS(void)ret;
+    Py_END_ALLOW_THREADS(void) ret;
 }
 
 static PyObject *FutexSemaphore_post(FutexSemaphore *self, PyObject *args, PyObject *kw)
