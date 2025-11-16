@@ -16,6 +16,10 @@ classifiers = [
   "Operating System :: POSIX :: Linux",
   "Programming Language :: C"
 ]
+dependencies = [
+  "numpy>=2",
+  "optree>=0"
+]
 
 [project.optional-dependencies]
 test = [
