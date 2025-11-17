@@ -198,7 +198,11 @@ class GuardedSharedMemory:
                         except OSError:
                             pass
                 time.sleep(backoff_base * (1 + random.random()))
-            except Exception:
+            except Exception as e:
+                if attach_only:
+                    raise NoShmFoundError(
+                        f"Shared memory segment '{name}' does not exist"
+                    ) from e
                 if fd is not None:
                     try:
                         os.close(fd)
@@ -209,7 +213,6 @@ class GuardedSharedMemory:
                             _shm_unlink_wrapped(self._posix_name_b)
                         except OSError:
                             pass
-                raise
         else:
             raise RuntimeError(
                 f"Failed to attach/create shm '{name}' after {max_attempts} attempts"
@@ -242,7 +245,7 @@ class GuardedSharedMemory:
         self._remove_pid_file()
 
         if self._has_other_alive_pids():
-            self._detach()
+            self.detach()
             self._closed = True
             self._unregister_atexit()
             return
@@ -257,7 +260,7 @@ class GuardedSharedMemory:
         except OSError:
             pass
 
-        self._detach()
+        self.detach()
         self._closed = True
         self._unregister_atexit()
 
@@ -323,7 +326,7 @@ class GuardedSharedMemory:
             pass
         return False
 
-    def _detach(self) -> None:
+    def detach(self) -> None:
         if self._buf is not None:
             try:
                 self._buf.release()
