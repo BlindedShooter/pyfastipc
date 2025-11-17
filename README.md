@@ -86,4 +86,4 @@ Notes:
 
 
 ## AI Code Generation
-Most of the writing of this library was assisted by AI (OpenAI Codex). The code was iteratively refined and tested to ensure correctness and performance.
+Writing of this library was assisted by AI (OpenAI Codex). The code was iteratively refined, checked, and tested manually to ensure correctness and performance.
