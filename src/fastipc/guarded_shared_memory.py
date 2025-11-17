@@ -8,7 +8,7 @@ import random
 import time
 from typing import Optional
 
-__all__ = ["GuardedSharedMemory"]
+__all__ = ["GuardedSharedMemory", "NoShmFoundError"]
 
 
 def _alive(pid: int) -> bool:
