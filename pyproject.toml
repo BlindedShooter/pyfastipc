@@ -7,7 +7,7 @@ name = "fastipc"
 version = "0.1.5"
 description = "Linux futex-based primitives (C extension)"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE",]
 authors = [{ name = "JihunLee", email = "gkadnflh@gmail.com" }]
@@ -39,7 +39,6 @@ where = ["src"]
 [tool.cibuildwheel]
 # Build CPython wheels for Linux only; PyPy and non-Linux are skipped.
 build = [
-  "cp39-*",
   "cp310-*",
   "cp311-*",
   "cp312-*",
