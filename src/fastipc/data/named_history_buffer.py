@@ -5,7 +5,7 @@ from functools import cached_property
 
 from fastipc.guarded_shared_memory import GuardedSharedMemory
 from fastipc._primitives import Mutex, FutexWord, AtomicU64
-from ctypes import Structure, c_int64, c_uint64, c_ubyte, sizeof
+from ctypes import Structure, c_uint64, c_ubyte, sizeof
 
 
 class NamedHistoryBufferHeader(Structure):
@@ -164,9 +164,7 @@ class NamedHistoryBuffer:
             slot_header.size = 0
             slot_header.start_version = 0
             slot_header.end_version = 1
-            slot_header.msg_idx = (
-                0xFFFFFFFFFFFFFFFF  # invalid msg_idx (practically impossible)
-            )
+            slot_header.msg_idx = 0
 
         return cls(name, _shm=shm)
 
@@ -335,9 +333,13 @@ class NamedHistoryBuffer:
             data = self.read(latest_idx)
             if data is not None:
                 return data
-        raise TimeoutError(f"Failed to read latest entry consistently after {max_retries} retries")
+        raise TimeoutError(
+            f"Failed to read latest entry consistently after {max_retries} retries"
+        )
 
-    def read_latest_with_timestamp(self, max_retries: int = 16) -> tuple[bytearray, float]:
+    def read_latest_with_timestamp(
+        self, max_retries: int = 16
+    ) -> tuple[bytearray, float]:
         """
         Retrieve the latest entry and its timestamp from the history buffer.
 
@@ -351,11 +353,13 @@ class NamedHistoryBuffer:
             data = self.read(latest_idx)
             if data is not None:
                 return data, timestamp
-        raise TimeoutError(f"Failed to read latest entry consistently after {max_retries} retries")
+        raise TimeoutError(
+            f"Failed to read latest entry consistently after {max_retries} retries"
+        )
 
 
 if __name__ == "__main__":
-    # hb = NamedHistoryBuffer.create("test_buffer", num_slots=8, slot_size=256, meta="Test History Buffer ASDADSDSDASDADS")
-    hb = NamedHistoryBuffer("test_buffer")
+    #hb = NamedHistoryBuffer.create("test_buffer2", num_slots=8, slot_size=256, meta="Test History Buffer ASDADSDSDASDADS")
+    hb = NamedHistoryBuffer("test_buffer2")
 
     print("Metadata:", hb.meta)
