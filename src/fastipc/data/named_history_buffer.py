@@ -1,41 +1,55 @@
 from __future__ import annotations
 
-from time import monotonic_ns
+from time import time, monotonic_ns
+from functools import cached_property
 
 from fastipc.guarded_shared_memory import GuardedSharedMemory
-from fastipc._primitives import Mutex
+from fastipc._primitives import Mutex, FutexWord, AtomicU64
 from ctypes import Structure, c_int64, c_uint64, c_ubyte, sizeof
 
 
 class NamedHistoryBufferHeader(Structure):
-    _pack_ = 64  # align to cache line size
     _fields_ = [
         ("magic", c_uint64),
         ("meta_size", c_uint64),
         ("num_slots", c_uint64),  # number of slots in the circular buffer
         ("slot_size", c_uint64),  # size of each slot's payload
-        ("msg_idx", c_int64,), # message id (index = id % buffer_size) of the next slot to write
-        ("_padding", c_ubyte * (64 - sizeof(c_uint64) * 5)),  # padding to cache line size
+        (
+            "_padding",
+            c_ubyte * (64 - sizeof(c_uint64) * 4),
+        ),  # padding to cache line size
         ("mutex", c_ubyte * 64),  # embedded mutex for writers
+        (
+            "msg_idx",
+            c_uint64,
+        ),  # message id (index = id % buffer_size) of the next slot to write.
+        (
+            "_padding2",
+            c_ubyte * (64 - sizeof(c_uint64)),
+        ),
     ]
     magic: c_uint64
     meta_size: c_uint64
     num_slots: c_uint64
-    slot_size: c_uint64 
-    msg_idx: c_int64
-    
+    slot_size: c_uint64
+    msg_idx: c_uint64
+
     def calc_total_size(self) -> int:
         return (
             sizeof(NamedHistoryBufferHeader)
             + self.num_slots * (sizeof(SlotHeader) + self.slot_size)
-            + (self.meta_size // 64 + 1) * 64  # align meta to cache line size
+            + self.meta_size
         )
-    
+
     def calc_meta_offset(self) -> int:
-        return sizeof(NamedHistoryBufferHeader)
-    
+        return sizeof(NamedHistoryBufferHeader) + self.num_slots * (
+            sizeof(SlotHeader) + self.slot_size
+        )
+
     def calc_slot_offset(self, slot_index: int) -> int:
-        return sizeof(NamedHistoryBufferHeader) + slot_index * (sizeof(SlotHeader) + self.slot_size)
+        return sizeof(NamedHistoryBufferHeader) + slot_index * (
+            sizeof(SlotHeader) + self.slot_size
+        )
 
     def validate_magic(self) -> None:
         if self.magic != 0x50464842:  # 'PFHB'
@@ -43,36 +57,43 @@ class NamedHistoryBufferHeader(Structure):
 
 
 class SlotHeader(Structure):
-    _pack_ = 64  # align to cache line size
     _fields_ = [
         ("size", c_uint64),  # payload size (smaller than slot_size)
         ("start_version", c_uint64),  # monotonic_ns
         ("end_version", c_uint64),  # monotonic_ns
-        ("_padding", c_ubyte * (64 - sizeof(c_uint64) * 3)),  # padding to cache line size
+        ("msg_idx", c_uint64),  # message id
+        (
+            "_padding",
+            c_ubyte * (64 - sizeof(c_uint64) * 4),
+        ),  # padding to cache line size
     ]
     size: c_uint64
     start_version: c_uint64
     end_version: c_uint64
+    msg_idx: c_uint64
 
 
 class NamedHistoryBuffer:
     """
     A named, cross-process history buffer backed by shared memory.
-    
+
     Layout:
     - NamedHistoryBufferHeader at offset 0x00
-    - SlotHeaders at offset 0x40
-    - Metadata 
-    - And payloads
-    
+    - [SlotHeaders + payloads] * num_slots
+    - Metadata string at the end
+
     """
+
     def __init__(self, name: str, *, _shm: GuardedSharedMemory | None = None) -> None:
         self._name = name
-        
+
         if _shm is None:
             # Attach to existing shared memory
             tmp_shm = GuardedSharedMemory(
-                f"__pyfastipc_history_buffer_{name}", size=sizeof(NamedHistoryBufferHeader), attach_only=True, try_cleanup_on_exit=False
+                f"__pyfastipc_history_buffer_{name}",
+                size=sizeof(NamedHistoryBufferHeader),
+                attach_only=True,
+                try_cleanup_on_exit=False,
             )  # attach only, will raise if not exists
             header = NamedHistoryBufferHeader.from_buffer(tmp_shm.buf)
             # Validate magic number
@@ -81,10 +102,13 @@ class NamedHistoryBuffer:
             total_size = header.calc_total_size()
             tmp_shm.detach()
             _shm = GuardedSharedMemory(
-                f"__pyfastipc_history_buffer_{name}", size=total_size, attach_only=True, try_cleanup_on_exit=False
+                f"__pyfastipc_history_buffer_{name}",
+                size=total_size,
+                attach_only=True,
+                try_cleanup_on_exit=False,
             )
         self._attach(_shm)
-    
+
     @classmethod
     def create(
         cls,
@@ -95,7 +119,7 @@ class NamedHistoryBuffer:
     ) -> "NamedHistoryBuffer":
         """
         Create a new NamedHistoryBuffer with the specified parameters.
-        
+
         :param name: Symbolic name for the shared memory region.
         :param num_slots: Number of slots in the circular buffer.
         :param slot_size: Size of each slot's payload in bytes.
@@ -106,24 +130,44 @@ class NamedHistoryBuffer:
         shm_size = (
             sizeof(NamedHistoryBufferHeader)
             + num_slots * (sizeof(SlotHeader) + slot_size)
-            + (len(meta_encoded) // 64 + 1) * 64  # align meta to cache line size
+            + len(meta_encoded)
         )
-        shm = GuardedSharedMemory(f"__pyfastipc_history_buffer_{name}", size=shm_size, try_cleanup_on_exit=False)
+        shm = GuardedSharedMemory(
+            f"__pyfastipc_history_buffer_{name}",
+            size=shm_size,
+            try_cleanup_on_exit=False,
+        )
+        shm.buf[: sizeof(NamedHistoryBufferHeader)] = b"\x00" * sizeof(
+            NamedHistoryBufferHeader
+        )
         header = NamedHistoryBufferHeader.from_buffer(shm.buf)
         header.magic = 0x50464842  # 'PFHB'
         header.meta_size = len(meta_encoded)
         header.num_slots = num_slots
         header.slot_size = slot_size
-        header.msg_idx = 0
-        
+
         # Initialize mutex
-        shm.buf[sizeof(NamedHistoryBufferHeader) - 64 : sizeof(NamedHistoryBufferHeader)] = b"\x00" * 64
-        mutex = Mutex(shm.buf[sizeof(NamedHistoryBufferHeader) - 64 : sizeof(NamedHistoryBufferHeader)], shared=True)
+        mutex = Mutex(shm.buf[64:128], shared=True)
         mutex.force_release()
-        
+
         # Write meta
         meta_offset = header.calc_meta_offset()
         shm.buf[meta_offset : meta_offset + len(meta_encoded)] = meta_encoded
+
+        # Initialize reader futex
+        header.msg_idx = 0
+
+        # Initialize SlotHeaders
+        for slot_idx in range(num_slots):
+            slot_offset = header.calc_slot_offset(slot_idx)
+            slot_header = SlotHeader.from_buffer(shm.buf, slot_offset)
+            slot_header.size = 0
+            slot_header.start_version = 0
+            slot_header.end_version = 1
+            slot_header.msg_idx = (
+                0xFFFFFFFFFFFFFFFF  # invalid msg_idx (practically impossible)
+            )
+
         return cls(name, _shm=shm)
 
     def _attach(self, shm: GuardedSharedMemory) -> None:
@@ -132,80 +176,186 @@ class NamedHistoryBuffer:
         if self._header.magic != 0x50464842:  # 'PFHB'
             raise ValueError("Shared memory segment has invalid magic number")
         self._writer_mutex = Mutex(
-            self._shm.buf[sizeof(NamedHistoryBufferHeader) - 64 : sizeof(NamedHistoryBufferHeader)],
+            self._shm.buf[64:128],
+            shared=True,
         )
-    
-    def get_meta(self) -> str:
+        self._msg_idx = AtomicU64(self._shm.buf[128:136])
+        # Futex for notifying readers
+        # Assumes little-endian architecture. (Futex on LSB)
+        self._reader_futex = FutexWord(shm.buf[128:132], shared=True)
+
+    def _get_slot_header(self, slot_index: int) -> SlotHeader:
+        """
+        Retrieve the SlotHeader for the specified slot index.
+
+        :param slot_index: Index of the slot.
+        :return: SlotHeader instance.
+        """
+        slot_offset = self._header.calc_slot_offset(slot_index)
+        return SlotHeader.from_buffer(self._shm.buf, slot_offset)
+
+    def wait_for_update(
+        self, last_msg_idx: int | None = None, timeout: float | None = None
+    ) -> int:
+        """
+        Wait for a new update in the history buffer.
+
+        :param last_msg_idx: The last known message index. If None, uses the current msg_idx.
+        :param timeout: Optional timeout in seconds.
+        :return: The new message index after the update.
+        """
+        if last_msg_idx is None:
+            last_msg_idx = self._msg_idx.load()
+
+        timeout_per_wait_ns = int(timeout * 1e9 // 10) if timeout is not None else None
+        for _ in range(
+            10
+        ):  # Would almost never loop, but just in case of spurious wakeups
+            current_msg_idx = self._msg_idx.load()
+            if current_msg_idx != last_msg_idx:
+                return current_msg_idx
+            self._reader_futex.wait(
+                expected_value=last_msg_idx,
+                timeout_ns=timeout_per_wait_ns,
+            )
+        else:
+            raise TimeoutError("Timeout waiting for update in NamedHistoryBuffer")
+
+    @cached_property
+    def meta(self) -> str:
         """
         Retrieve the metadata string stored in the history buffer.
-        
+
         :return: Metadata string.
         """
         meta_offset = self._header.calc_meta_offset()
         meta_bytes = self._shm.buf[meta_offset : meta_offset + self._header.meta_size]
         return meta_bytes.tobytes().decode("utf-8")
 
-    def get_slot_header(self, slot_index: int) -> SlotHeader:
-        """
-        Retrieve the SlotHeader for the specified slot index.
-        
-        :param slot_index: Index of the slot.
-        :return: SlotHeader instance.
-        """
-        slot_offset = self._header.calc_slot_offset(slot_index)
-        return SlotHeader.from_buffer(self._shm.buf, slot_offset)
-    
     def publish(self, data: bytes) -> None:
         """
         Publish data to the next slot in the history buffer.
-        
+
         :param data: Data bytes to publish (must be <= slot_size).
         :raises ValueError: If data size exceeds slot_size.
         """
         if len(data) > self._header.slot_size:
-            raise ValueError(f"Data size {len(data)} exceeds slot size {self._header.slot_size}")
-        
-        self._writer_mutex.acquire()
-        try:
-            msg_idx = self._header.msg_idx
+            raise ValueError(
+                f"Data size {len(data)} exceeds slot size {self._header.slot_size}"
+            )
+
+        with self._writer_mutex:
+            msg_idx = self._msg_idx.load()
             slot_index = msg_idx % self._header.num_slots
-            slot_header = self.get_slot_header(slot_index)
-            
+            slot_header = self._get_slot_header(slot_index)
+
             # Update slot header
             slot_header.size = len(data)
-            slot_header.start_version = monotonic_ns()
+            version = monotonic_ns()
+            slot_header.start_version = version
             # Write data
-            payload_offset = self._header.calc_slot_offset(slot_index) + sizeof(SlotHeader)
+            payload_offset = self._header.calc_slot_offset(slot_index) + sizeof(
+                SlotHeader
+            )
             self._shm.buf[payload_offset : payload_offset + len(data)] = data
-            slot_header.end_version = monotonic_ns()
-            
-            # Advance message index
-            self._header.msg_idx += 1
-        finally:
-            self._writer_mutex.release()
+            slot_header.end_version = version
+            slot_header.msg_idx = msg_idx
 
-    def get_latest(self, copy: bool = True) -> bytes:
+            # Advance message index
+            self._msg_idx.store(msg_idx + 1)
+            # Notify readers (aligned 8-byte write is implicitly atomic)
+            self._reader_futex.wake(0xFFFFFFFF)  # wake all waiters
+
+    def _check_slot_index(self, msg_idx: int) -> int:
+        if msg_idx < 0:
+            raise ValueError("msg_idx must be non-negative")
+
+        current_msg_idx = self._msg_idx.load()
+        if msg_idx >= current_msg_idx:
+            raise ValueError("msg_idx is out of range (not yet published)")
+        if msg_idx < current_msg_idx - self._header.num_slots:
+            raise ValueError("msg_idx is out of range (already overwritten)")
+        return msg_idx % self._header.num_slots
+
+    def get_timestamp(self, msg_idx: int) -> float:
         """
-        Retrieve the latest entry from the history buffer.
-        
-        :return: Data bytes for the latest entry.
+        Retrieve the timestamp (monotonic_ns) of the entry at the specified message index.
+
+        :param msg_idx: Message index to retrieve timestamp for.
+        :return: Timestamp of the specified entry.
+        :raises ValueError: If msg_idx is out of range.
+        :raises ValueError: If msg_idx slot is already overwritten.
         """
-        msg_idx = self._header.msg_idx
-        if msg_idx == 0:
-            raise ValueError("No entries in history buffer")
-        slot_index = (msg_idx - 1) % self._header.num_slots
-        slot_header = self.get_slot_header(slot_index)
+        if msg_idx < 0:
+            raise ValueError("msg_idx must be non-negative")
+
+        slot_index = self._check_slot_index(msg_idx)
+        slot_header = self._get_slot_header(slot_index)
+        if slot_header.msg_idx != msg_idx:
+            raise ValueError("msg_idx is out of range (already overwritten)")
+        # Map monotonic_ns to approximate POSIX timestamp
+        # offset ~= time() - monotonic_ns() / 1e9
+        timestamp = time() - monotonic_ns() / 1e9 + slot_header.end_version / 1e9
+        return timestamp
+
+    def read(self, msg_idx: int) -> bytearray | None:
+        """
+        Retrieve the entry at the specified message index from the history buffer.
+
+        :param msg_idx: Message index to retrieve.
+        :return: Data bytes for the specified entry, or None if inconsistent read.
+        :raises ValueError: If msg_idx is out of range.
+        """
+        slot_index = self._check_slot_index(msg_idx)
+        slot_header = self._get_slot_header(slot_index)
+
+        if slot_header.msg_idx != msg_idx:
+            return None  # already overwritten
+        end_version_at_start = slot_header.end_version
         payload_offset = self._header.calc_slot_offset(slot_index) + sizeof(SlotHeader)
         data = self._shm.buf[payload_offset : payload_offset + slot_header.size]
-        
-        if copy:
-            # Need to check start_version and end_version to ensure data consistency
-            return data.tobytes()
+
+        # Need to check start_version and end_version to ensure data consistency
+        ret = bytearray(data)  # make a copy of memoryview
+        if end_version_at_start == slot_header.start_version:
+            return ret
         else:
-            return data
+            return None  # inconsistent read
+
+    def read_latest(self, max_retries: int = 16) -> bytearray:
+        """
+        Retrieve the latest entry from the history buffer.
+
+        :return: Data bytes for the latest entry.
+        :raises TimeoutError: If unable to read a consistent latest entry after retries.
+        :raises ValueError: If no entries have been published yet.
+        """
+        for _ in range(max_retries):
+            latest_idx = self._msg_idx.load() - 1
+            data = self.read(latest_idx)
+            if data is not None:
+                return data
+        raise TimeoutError(f"Failed to read latest entry consistently after {max_retries} retries")
+
+    def read_latest_with_timestamp(self, max_retries: int = 16) -> tuple[bytearray, float]:
+        """
+        Retrieve the latest entry and its timestamp from the history buffer.
+
+        :return: Tuple of (data bytes, timestamp).
+        :raises TimeoutError: If unable to read a consistent latest entry after retries.
+        :raises ValueError: If no entries have been published yet.
+        """
+        for _ in range(max_retries):
+            latest_idx = self._msg_idx.load() - 1
+            timestamp = self.get_timestamp(latest_idx)  # read timestamp first
+            data = self.read(latest_idx)
+            if data is not None:
+                return data, timestamp
+        raise TimeoutError(f"Failed to read latest entry consistently after {max_retries} retries")
+
 
 if __name__ == "__main__":
-    #hb = NamedHistoryBuffer.create("test_buffer", num_slots=8, slot_size=256, meta="Test History Buffer ASDADSDSDASDADS")
+    # hb = NamedHistoryBuffer.create("test_buffer", num_slots=8, slot_size=256, meta="Test History Buffer ASDADSDSDASDADS")
     hb = NamedHistoryBuffer("test_buffer")
-    
-    print("Metadata:", hb.get_meta())
+
+    print("Metadata:", hb.meta)
