@@ -205,3 +205,6 @@ __marimo__/
 .benchmarks/
 *.whl
 *.pyd
+
+# pytest
+.fastipc_pids/
