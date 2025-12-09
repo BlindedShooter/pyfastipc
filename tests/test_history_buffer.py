@@ -719,7 +719,7 @@ class TestPerformance:
         
         benchmark(read_with_retry)
 
-    @pytest.mark.slow
+    @pytest.mark.bench_heavy
     def test_sustained_throughput_benchmark(self, benchmark, buffer_name):
         """Benchmark sustained throughput over many operations"""
         # Create dedicated buffer for this test
