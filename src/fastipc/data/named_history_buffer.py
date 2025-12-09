@@ -108,6 +108,7 @@ class NamedHistoryBuffer:
                 try_cleanup_on_exit=False,
             )
         self._attach(_shm)
+        self._is_closed = False
 
     @classmethod
     def create(
@@ -213,7 +214,7 @@ class NamedHistoryBuffer:
             if current_msg_idx != last_msg_idx:
                 return current_msg_idx
             self._reader_futex.wait(
-                expected_value=last_msg_idx,
+                expected=last_msg_idx,
                 timeout_ns=timeout_per_wait_ns,
             )
         else:
@@ -236,7 +237,11 @@ class NamedHistoryBuffer:
 
         :param data: Data bytes to publish (must be <= slot_size).
         :raises ValueError: If data size exceeds slot_size.
+        :raises ValueError: If the buffer is closed.
         """
+        if self.closed:
+            raise ValueError("Cannot publish to a closed NamedHistoryBuffer")
+
         if len(data) > self._header.slot_size:
             raise ValueError(
                 f"Data size {len(data)} exceeds slot size {self._header.slot_size}"
@@ -262,17 +267,14 @@ class NamedHistoryBuffer:
             # Advance message index
             self._msg_idx.store(msg_idx + 1)
             # Notify readers (aligned 8-byte write is implicitly atomic)
-            self._reader_futex.wake(0xFFFFFFFF)  # wake all waiters
+            self._reader_futex.wake(-1)  # wake all waiters
 
     def _check_slot_index(self, msg_idx: int) -> int:
-        if msg_idx < 0:
-            raise ValueError("msg_idx must be non-negative")
-
         current_msg_idx = self._msg_idx.load()
         if msg_idx >= current_msg_idx:
             raise ValueError("msg_idx is out of range (not yet published)")
-        if msg_idx < current_msg_idx - self._header.num_slots:
-            raise ValueError("msg_idx is out of range (already overwritten)")
+        if msg_idx < max(0, current_msg_idx - self._header.num_slots):
+            raise ValueError("msg_idx is out of range (already overwritten or invalid)")
         return msg_idx % self._header.num_slots
 
     def get_timestamp(self, msg_idx: int) -> float:
@@ -283,7 +285,11 @@ class NamedHistoryBuffer:
         :return: Timestamp of the specified entry.
         :raises ValueError: If msg_idx is out of range.
         :raises ValueError: If msg_idx slot is already overwritten.
+        :raises ValueError: If the buffer is closed.
         """
+        if self.closed:
+            raise ValueError("Cannot get timestamp from a closed buffer")
+        
         if msg_idx < 0:
             raise ValueError("msg_idx must be non-negative")
 
@@ -303,7 +309,10 @@ class NamedHistoryBuffer:
         :param msg_idx: Message index to retrieve.
         :return: Data bytes for the specified entry, or None if inconsistent read.
         :raises ValueError: If msg_idx is out of range.
+        :raises ValueError: If the buffer is closed.
         """
+        if self.closed:
+            raise ValueError("Cannot read from a closed buffer")
         slot_index = self._check_slot_index(msg_idx)
         slot_header = self._get_slot_header(slot_index)
 
@@ -327,12 +336,17 @@ class NamedHistoryBuffer:
         :return: Data bytes for the latest entry.
         :raises TimeoutError: If unable to read a consistent latest entry after retries.
         :raises ValueError: If no entries have been published yet.
+        :raises ValueError: If the buffer is closed.
         """
+        if self.closed:
+            raise ValueError("Cannot read from a closed buffer")
+
         for _ in range(max_retries):
             latest_idx = self._msg_idx.load() - 1
-            data = self.read(latest_idx)
+            data = self.read(latest_idx)  # check and raise anything here
             if data is not None:
                 return data
+
         raise TimeoutError(
             f"Failed to read latest entry consistently after {max_retries} retries"
         )
@@ -357,9 +371,21 @@ class NamedHistoryBuffer:
             f"Failed to read latest entry consistently after {max_retries} retries"
         )
 
+    def close(self, try_unlink: bool = False) -> None:
+        """Close the shared memory segment."""
+        self._shm.detach()
+        if try_unlink:
+            self._shm.close()
+        self._is_closed = True
+
+    @property
+    def closed(self) -> bool:
+        """Check if the shared memory segment is closed."""
+        return self._is_closed
+
 
 if __name__ == "__main__":
-    #hb = NamedHistoryBuffer.create("test_buffer2", num_slots=8, slot_size=256, meta="Test History Buffer ASDADSDSDASDADS")
+    # hb = NamedHistoryBuffer.create("test_buffer2", num_slots=8, slot_size=256, meta="Test History Buffer ASDADSDSDASDADS")
     hb = NamedHistoryBuffer("test_buffer2")
 
     print("Metadata:", hb.meta)
