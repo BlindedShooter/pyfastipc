@@ -64,6 +64,8 @@ def test_named_mutex_threads():
     name = f"mtx_{os.getpid()}_{time.time_ns()}"
     m1 = NamedMutex(name)
     m2 = NamedMutex(name)
+    m1.force_release()
+    m2.force_release()
     inside = 0
     max_inside = 0
 
@@ -140,6 +142,7 @@ def test_named_mutex_benchmark(benchmark):
     _ensure_pid_dir()
     name = f"mtx_b_{os.getpid()}_{time.time_ns()}"
     m = NamedMutex(name)
+    m.force_release()
 
     def acq_rel_n():
         for _ in range(3000):
