@@ -92,7 +92,10 @@ def validate_layout(tree: NumpyTree, layout: LayoutTree) -> None:
 
 
 def serialize_nptree(
-    nptree: NumpyTree, layout: LayoutTree, buffer: bytearray | None = None
+    nptree: NumpyTree,
+    layout: LayoutTree,
+    buffer: bytearray | None = None,
+    buf_size_from_layout: int | None = None,
 ) -> bytearray:
     """
     Serialize a NumpyTree into a backing buffer according to the provided layout.
@@ -100,13 +103,14 @@ def serialize_nptree(
     :param nptree: The NumpyTree to serialize.
     :param layout: The NumpyTree layout.
     :param buffer: Optional backing buffer to use. If None, a new buffer is created.
+    :param buf_size_from_layout: Optional minimum buffer size, calculated from layout.
     :return: The backing buffer containing the serialized data.
     :raises: ValueError if `nptree` does not match `layout` or buffer is too small.
     """
     if optree.tree_structure(nptree) != optree.tree_structure(layout):
         raise ValueError("NumpyTree structure does not match layout structure.")
 
-    buffer_size = calc_buffer_size(layout)
+    buffer_size = buf_size_from_layout or calc_buffer_size(layout)
     if buffer is None:
         buffer = bytearray(buffer_size)
     elif len(buffer) < buffer_size:
@@ -125,7 +129,9 @@ def serialize_nptree(
 
 
 def deserialize_nptree(
-    layout: LayoutTree, buffer: bytearray | None = None
+    layout: LayoutTree,
+    buffer: bytearray | None = None,
+    buf_size_from_layout: int | None = None,
 ) -> NumpyTree:
     """
     Materialize a NumpyTree view from a layout and a backing buffer.
@@ -135,11 +141,11 @@ def deserialize_nptree(
     :return: The reconstructed NumpyTree.
     :raises: ValueError if buffer is too small.
     """
-    min_buffer_size = calc_buffer_size(layout)
+    buffer_size = buf_size_from_layout or calc_buffer_size(layout)
 
     if buffer is None:
-        buffer = bytearray(min_buffer_size)
-    elif len(buffer) < min_buffer_size:
+        buffer = bytearray(buffer_size)
+    elif len(buffer) < buffer_size:
         raise ValueError("Provided buffer is smaller than required size.")
 
     def _desc_to_arr(arr_layout: str) -> np.ndarray:
