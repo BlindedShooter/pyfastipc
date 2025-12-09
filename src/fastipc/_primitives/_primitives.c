@@ -1,4 +1,4 @@
-// futexmod.c
+// _primitives.c
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE 1
 #endif
@@ -443,8 +443,9 @@ static PyTypeObject AtomicU64Type = {
 #define MUTEX_OFF_MAGIC 0u
 #define MUTEX_OFF_FLAGS 4u
 #define MUTEX_OFF_STATE 8u
-#define MUTEX_OFF_OWNER 12u
-#define MUTEX_OFF_LASTNS 16u
+#define MUTEX_OFF_OWNER_PID 12u
+#define MUTEX_OFF_OWNER_TID 16u
+#define MUTEX_OFF_LASTNS 20u
 
 // Layout (Semaphore):
 //   0x00: u32 magic ('SEMA')
@@ -541,16 +542,17 @@ static void FutexMutex_dealloc(FutexMutex *self)
 static PyObject *FutexMutex_release(FutexMutex *self, PyObject *Py_UNUSED(ignored))
 {
     // check owner pid and release only if we own the lock
-    if (u32_load_acq(self->base, MUTEX_OFF_OWNER) != (uint32_t)getpid())
+    if (u32_load_acq(self->base, MUTEX_OFF_OWNER_TID) != (uint32_t)gettid())
     {
-        PyErr_SetString(PyExc_RuntimeError, "cannot release a mutex not owned by this process");
+        PyErr_SetString(PyExc_RuntimeError, "cannot release a mutex not owned by this thread");
         return NULL;
     }
 
     // Set state to 0; wake exactly one waiter only if we observed contended state (2)
     uint32_t prev = u32_xchg_rel(self->base, MUTEX_OFF_STATE, 0);
     // Clear owner
-    u32_store_rel(self->base, MUTEX_OFF_OWNER, 0);
+    u32_store_rel(self->base, MUTEX_OFF_OWNER_PID, 0);
+    u32_store_rel(self->base, MUTEX_OFF_OWNER_TID, 0);
 
     if (prev == 2)
     {
@@ -571,7 +573,8 @@ static PyObject *FutexMutex_force_release(FutexMutex *self, PyObject *Py_UNUSED(
     uint32_t prev = u32_xchg_rel(self->base, MUTEX_OFF_STATE, 0);
 
     // Clear owner unconditionally
-    u32_store_rel(self->base, MUTEX_OFF_OWNER, 0);
+    u32_store_rel(self->base, MUTEX_OFF_OWNER_PID, 0);
+    u32_store_rel(self->base, MUTEX_OFF_OWNER_TID, 0);
     if (prev == 2)
     {
         int op_wake = self->shared ? FUTEX_WAKE : FUTEX_WAKE_PRIVATE;
@@ -585,7 +588,12 @@ static PyObject *FutexMutex_force_release(FutexMutex *self, PyObject *Py_UNUSED(
 
 static PyObject *FutexMutex_owner_pid(FutexMutex *self, PyObject *Py_UNUSED(ignored))
 {
-    uint32_t v = u32_load_acq(self->base, MUTEX_OFF_OWNER);
+    uint32_t v = u32_load_acq(self->base, MUTEX_OFF_OWNER_PID);
+    return PyLong_FromUnsignedLong(v);
+}
+static PyObject *FutexMutex_owner_tid(FutexMutex *self, PyObject *Py_UNUSED(ignored))
+{
+    uint32_t v = u32_load_acq(self->base, MUTEX_OFF_OWNER_TID);
     return PyLong_FromUnsignedLong(v);
 }
 static PyObject *FutexMutex_last_acquired_ns(FutexMutex *self, PyObject *Py_UNUSED(ignored))
@@ -605,7 +613,8 @@ static PyObject *FutexMutex_try_acquire(FutexMutex *self, PyObject *Py_UNUSED(ig
     uint32_t expected = 0;
     if (u32_cas_acqrel(self->base, MUTEX_OFF_STATE, &expected, 1))
     {
-        u32_store_rel(self->base, MUTEX_OFF_OWNER, (uint32_t)getpid());
+        u32_store_rel(self->base, MUTEX_OFF_OWNER_PID, (uint32_t)getpid());
+        u32_store_rel(self->base, MUTEX_OFF_OWNER_TID, (uint32_t)gettid());
         u64_store_rel_unaligned(self->base, MUTEX_OFF_LASTNS, now_realtime_ns());
         Py_RETURN_TRUE;
     }
@@ -617,15 +626,16 @@ static PyObject *FutexMutex_acquire_fast(FutexMutex *self, PyObject *Py_UNUSED(i
     uint32_t expected = 0;
 
     // Check owner pid and raise if we already own the lock
-    if (u32_load_acq(self->base, MUTEX_OFF_OWNER) == (uint32_t)getpid())
+    if (u32_load_acq(self->base, MUTEX_OFF_OWNER_TID) == (uint32_t)gettid())
     {
-        PyErr_SetString(PyExc_RuntimeError, "cannot re-acquire a mutex already owned by this process");
+        PyErr_SetString(PyExc_RuntimeError, "cannot re-acquire a mutex already owned by this thread");
         return NULL;
     }
 
     if (u32_cas_acqrel(self->base, MUTEX_OFF_STATE, &expected, 1))
     {
-        u32_store_rel(self->base, MUTEX_OFF_OWNER, (uint32_t)getpid());
+        u32_store_rel(self->base, MUTEX_OFF_OWNER_PID, (uint32_t)getpid());
+        u32_store_rel(self->base, MUTEX_OFF_OWNER_TID, (uint32_t)gettid());
         u64_store_rel_unaligned(self->base, MUTEX_OFF_LASTNS, now_realtime_ns());
         Py_RETURN_TRUE;
     }
@@ -642,7 +652,8 @@ static PyObject *FutexMutex_acquire_fast(FutexMutex *self, PyObject *Py_UNUSED(i
         Py_END_ALLOW_THREADS(void) ret;
     }
     // We now hold the lock with state=2 (contended). Keep it 2 to preserve waiter flag.
-    u32_store_rel(self->base, MUTEX_OFF_OWNER, (uint32_t)getpid());
+    u32_store_rel(self->base, MUTEX_OFF_OWNER_PID, (uint32_t)getpid());
+    u32_store_rel(self->base, MUTEX_OFF_OWNER_TID, (uint32_t)gettid());
     u64_store_rel_unaligned(self->base, MUTEX_OFF_LASTNS, now_realtime_ns());
     Py_RETURN_TRUE;
 }
@@ -655,10 +666,18 @@ static PyObject *FutexMutex_acquire_ns(FutexMutex *self, PyObject *args, PyObjec
     if (!PyArg_ParseTupleAndKeywords(args, kw, "|Li", kwlist, &timeout_ns, &spin))
         return NULL;
 
+    // Check owner tid and raise if we already own the lock
+    if (u32_load_acq(self->base, MUTEX_OFF_OWNER_TID) == (uint32_t)gettid())
+    {
+        PyErr_SetString(PyExc_RuntimeError, "cannot re-acquire a mutex already owned by this thread");
+        return NULL;
+    }
+
     uint32_t expected = 0;
     if (u32_cas_acqrel(self->base, MUTEX_OFF_STATE, &expected, 1))
     {
-        u32_store_rel(self->base, MUTEX_OFF_OWNER, (uint32_t)getpid());
+        u32_store_rel(self->base, MUTEX_OFF_OWNER_PID, (uint32_t)getpid());
+        u32_store_rel(self->base, MUTEX_OFF_OWNER_TID, (uint32_t)gettid());
         u64_store_rel_unaligned(self->base, MUTEX_OFF_LASTNS, now_realtime_ns());
         Py_RETURN_TRUE;
     }
@@ -671,7 +690,8 @@ static PyObject *FutexMutex_acquire_ns(FutexMutex *self, PyObject *args, PyObjec
             uint32_t e2 = 0;
             if (atomic_compare_exchange_weak_explicit((_Atomic uint32_t *)(self->base + MUTEX_OFF_STATE), &e2, 1, memory_order_acquire, memory_order_relaxed))
             {
-                u32_store_rel(self->base, MUTEX_OFF_OWNER, (uint32_t)getpid());
+                u32_store_rel(self->base, MUTEX_OFF_OWNER_PID, (uint32_t)getpid());
+                u32_store_rel(self->base, MUTEX_OFF_OWNER_TID, (uint32_t)gettid());
                 u64_store_rel_unaligned(self->base, MUTEX_OFF_LASTNS, now_realtime_ns());
                 Py_RETURN_TRUE;
             }
@@ -712,7 +732,8 @@ static PyObject *FutexMutex_acquire_ns(FutexMutex *self, PyObject *args, PyObjec
         // otherwise, loop (spurious wake tolerated)
     }
     // Keep state=2 (contended) to ensure release will wake waiters.
-    u32_store_rel(self->base, MUTEX_OFF_OWNER, (uint32_t)getpid());
+    u32_store_rel(self->base, MUTEX_OFF_OWNER_PID, (uint32_t)getpid());
+    u32_store_rel(self->base, MUTEX_OFF_OWNER_TID, (uint32_t)gettid());
     u64_store_rel_unaligned(self->base, MUTEX_OFF_LASTNS, now_realtime_ns());
     Py_RETURN_TRUE;
 }
@@ -724,7 +745,8 @@ static PyObject *FutexMutex_enter(FutexMutex *self, PyObject *Py_UNUSED(ignored)
     if (u32_cas_acqrel(self->base, MUTEX_OFF_STATE, &expected, 1))
     {
         Py_INCREF(self);
-        u32_store_rel(self->base, MUTEX_OFF_OWNER, (uint32_t)getpid());
+        u32_store_rel(self->base, MUTEX_OFF_OWNER_PID, (uint32_t)getpid());
+        u32_store_rel(self->base, MUTEX_OFF_OWNER_TID, (uint32_t)gettid());
         u64_store_rel_unaligned(self->base, MUTEX_OFF_LASTNS, now_realtime_ns());
         return (PyObject *)self;
     }
@@ -738,7 +760,8 @@ static PyObject *FutexMutex_enter(FutexMutex *self, PyObject *Py_UNUSED(ignored)
             if (atomic_compare_exchange_weak_explicit((_Atomic uint32_t *)(self->base + MUTEX_OFF_STATE), &exp2, 1, memory_order_acquire, memory_order_relaxed))
             {
                 Py_INCREF(self);
-                u32_store_rel(self->base, MUTEX_OFF_OWNER, (uint32_t)getpid());
+                u32_store_rel(self->base, MUTEX_OFF_OWNER_PID, (uint32_t)getpid());
+                u32_store_rel(self->base, MUTEX_OFF_OWNER_TID, (uint32_t)gettid());
                 u64_store_rel_unaligned(self->base, MUTEX_OFF_LASTNS, now_realtime_ns());
                 return (PyObject *)self;
             }
@@ -760,7 +783,8 @@ static PyObject *FutexMutex_enter(FutexMutex *self, PyObject *Py_UNUSED(ignored)
         (void)err;
     }
     // Keep state=2 (contended) to ensure release will wake waiters.
-    u32_store_rel(self->base, MUTEX_OFF_OWNER, (uint32_t)getpid());
+    u32_store_rel(self->base, MUTEX_OFF_OWNER_PID, (uint32_t)getpid());
+    u32_store_rel(self->base, MUTEX_OFF_OWNER_TID, (uint32_t)gettid());
     u64_store_rel_unaligned(self->base, MUTEX_OFF_LASTNS, now_realtime_ns());
     Py_INCREF(self);
     return (PyObject *)self;
@@ -777,6 +801,7 @@ static PyMethodDef FutexMutex_methods[] = {
     {"force_release", (PyCFunction)FutexMutex_force_release, METH_NOARGS, "forcibly unlock the mutex"},
     {"try_acquire", (PyCFunction)FutexMutex_try_acquire, METH_NOARGS, "nonblocking acquire"},
     {"owner_pid", (PyCFunction)FutexMutex_owner_pid, METH_NOARGS, "current owner PID or 0"},
+    {"owner_tid", (PyCFunction)FutexMutex_owner_tid, METH_NOARGS, "current owner TID or 0"},
     {"last_acquired_ns", (PyCFunction)FutexMutex_last_acquired_ns, METH_NOARGS, "last successful acquisition time (ns)"},
     {"magic", (PyCFunction)FutexMutex_magic, METH_NOARGS, "Get magic constant"},
     {"__enter__", (PyCFunction)FutexMutex_enter, METH_NOARGS, "ctx enter"},
@@ -786,7 +811,7 @@ static PyMethodDef FutexMutex_methods[] = {
 static PyObject *FutexMutex_repr(PyObject *self)
 {
     FutexMutex *s = (FutexMutex *)self;
-    uint32_t owner = u32_load_acq(s->base, MUTEX_OFF_OWNER);
+    uint32_t owner = u32_load_acq(s->base, MUTEX_OFF_OWNER_PID);
     uint64_t ts = u64_load_acq_unaligned(s->base, MUTEX_OFF_LASTNS);
     uint32_t st = u32_load_acq(s->base, MUTEX_OFF_STATE);
     return PyUnicode_FromFormat("<fastipc.Mutex buf=%p shared=%d state=%u owner=%u last_ns=%llu>", (void *)s->base, s->shared, (unsigned)st, (unsigned)owner, (unsigned long long)ts);
