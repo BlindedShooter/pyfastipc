@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from time import time, monotonic_ns
 from functools import cached_property
+from hashlib import md5
 
 from fastipc.guarded_shared_memory import GuardedSharedMemory
 from fastipc._primitives import Mutex, FutexWord, AtomicU64
@@ -14,25 +15,27 @@ class NamedHistoryBufferHeader(Structure):
         ("meta_size", c_uint64),
         ("num_slots", c_uint64),  # number of slots in the circular buffer
         ("slot_size", c_uint64),  # size of each slot's payload
+        ("meta_md5", c_ubyte * 16),  # metadata MD5 checksum
         (
             "_padding",
-            c_ubyte * (64 - sizeof(c_uint64) * 4),
-        ),  # padding to cache line size
+            c_ubyte * (64 - sizeof(c_uint64) * 6),
+        ),  # padding to 64B cache line size
+        ("reserved", c_ubyte * 192),  # reserved for future use
+        # total: 256B
         ("mutex", c_ubyte * 64),  # embedded mutex for writers
-        (
-            "msg_idx",
-            c_uint64,
-        ),  # message id (index = id % buffer_size) of the next slot to write.
-        (
-            "_padding2",
-            c_ubyte * (64 - sizeof(c_uint64)),
-        ),
+        ("msg_idx", c_uint64),  # message id of the next slot to write.
+        ("_padding2", c_ubyte * (64 - sizeof(c_uint64))),
+        # 192B
+        ("header_md5", c_ubyte * 16),  # header MD5 checksum (only first 256B)
+        ("_padding3", c_ubyte * (64 - 16)),  # padding to align 64B
     ]
     magic: c_uint64
     meta_size: c_uint64
     num_slots: c_uint64
     slot_size: c_uint64
+    meta_md5: bytearray
     msg_idx: c_uint64
+    header_md5: bytearray
 
     def calc_total_size(self) -> int:
         return (
@@ -128,6 +131,7 @@ class NamedHistoryBuffer:
         :return: An instance of NamedHistoryBuffer.
         """
         meta_encoded = meta.encode("utf-8")
+        meta_md5 = md5(meta_encoded).digest()
         shm_size = (
             sizeof(NamedHistoryBufferHeader)
             + num_slots * (sizeof(SlotHeader) + slot_size)
@@ -146,6 +150,11 @@ class NamedHistoryBuffer:
         header.meta_size = len(meta_encoded)
         header.num_slots = num_slots
         header.slot_size = slot_size
+        header.meta_md5[:] = meta_md5
+
+        header_bytes = bytes(shm.buf[:64])
+        header_md5 = md5(header_bytes).digest()
+        header.header_md5[:] = header_md5
 
         # Initialize mutex
         mutex = Mutex(shm.buf[64:128], shared=True)
@@ -168,20 +177,45 @@ class NamedHistoryBuffer:
             slot_header.msg_idx = 0
 
         return cls(name, _shm=shm)
+    
+    def validate_md5(self) -> None:
+        """
+        Validate the MD5 checksums of the header and metadata.
+
+        :raises ValueError: If the MD5 checksums do not match.
+        """
+        # Validate header MD5
+        header_bytes = bytes(self._shm.buf[:64])
+        expected_header_md5 = md5(header_bytes).digest()
+        actual_header_md5 = bytes(self._header.header_md5)
+        print("Expected header MD5:", expected_header_md5)
+        print("Actual header MD5:  ", actual_header_md5)
+        if expected_header_md5 != actual_header_md5:
+            raise ValueError("Header MD5 checksum does not match")
+
+        # Validate metadata MD5
+        meta_offset = self._header.calc_meta_offset()
+        meta_bytes = self._shm.buf[meta_offset : meta_offset + self._header.meta_size]
+        expected_meta_md5 = md5(meta_bytes).digest()
+        actual_meta_md5 = bytes(self._header.meta_md5)
+        if expected_meta_md5 != actual_meta_md5:
+            raise ValueError("Metadata MD5 checksum does not match")
 
     def _attach(self, shm: GuardedSharedMemory) -> None:
         self._shm = shm
         self._header = NamedHistoryBufferHeader.from_buffer(self._shm.buf)
         if self._header.magic != 0x50464842:  # 'PFHB'
             raise ValueError("Shared memory segment has invalid magic number")
+        self.validate_md5()
+    
         self._writer_mutex = Mutex(
-            self._shm.buf[64:128],
+            self._shm.buf[256:320],
             shared=True,
         )
-        self._msg_idx = AtomicU64(self._shm.buf[128:136])
+        self._msg_idx = AtomicU64(self._shm.buf[320:328])
         # Futex for notifying readers
         # Assumes little-endian architecture. (Futex on LSB)
-        self._reader_futex = FutexWord(shm.buf[128:132], shared=True)
+        self._reader_futex = FutexWord(shm.buf[320:324], shared=True)
 
     def _get_slot_header(self, slot_index: int) -> SlotHeader:
         """
@@ -289,7 +323,7 @@ class NamedHistoryBuffer:
         """
         if self.closed:
             raise ValueError("Cannot get timestamp from a closed buffer")
-        
+
         if msg_idx < 0:
             raise ValueError("msg_idx must be non-negative")
 
@@ -385,7 +419,18 @@ class NamedHistoryBuffer:
 
 
 if __name__ == "__main__":
-    # hb = NamedHistoryBuffer.create("test_buffer2", num_slots=8, slot_size=256, meta="Test History Buffer ASDADSDSDASDADS")
-    hb = NamedHistoryBuffer("test_buffer2")
+    meta_string = "Test History Buffer ASDADSDSDASDADS"
+    hb = NamedHistoryBuffer.create(
+        "test_buffer2", num_slots=8, slot_size=256, meta=meta_string
+    )
+    # hb = NamedHistoryBuffer("test_buffer2")
+    meta_md5 = md5(meta_string.encode("utf-8")).digest()
 
     print("Metadata:", hb.meta)
+
+    print("Meta hash:    ", hb._shm.buf[32:48].tobytes())
+    print("Expected hash:", meta_md5)
+    print("=============")
+
+    print("Header MD5:    ", hb._shm.buf[192:208].tobytes())
+    hb.close(try_unlink=True)
